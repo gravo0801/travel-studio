@@ -3,8 +3,11 @@ import {
   Plus, MapPin, Cloud, CloudOff, X, ChevronRight,
   Sparkles, Copy, BookOpen, Briefcase, Loader2,
   Check, Camera, Edit3, Calendar, Upload, GripVertical,
-  Map, ShieldCheck, Eye, EyeOff, Settings, Trash2, AlertCircle
+  Map, ShieldCheck, Eye, EyeOff, Settings, Trash2, AlertCircle,
+  Image as ImageIcon, ExternalLink, ArrowLeft
 } from 'lucide-react';
+import * as fb from './firebase.js';
+import * as gp from './googlePhotos.js';
 
 /* =============================================================================
    Travel Studio v1 — 통합 앱
@@ -82,6 +85,21 @@ const dateRange = (s, e) => {
 };
 const guessFlag = (c) => c ? FLAG_MAP[c.toLowerCase().trim()] || null : null;
 
+// 사진 처리 헬퍼 (모듈 레벨 — 여러 컴포넌트에서 공유)
+const fileToB64 = (f) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(f); });
+const resizeImg = (b64, max=1280) => new Promise(res => {
+  const img = new Image();
+  img.onload = () => {
+    let { width: w, height: h } = img;
+    if (Math.max(w, h) <= max) { res(b64); return; }
+    const s = max / Math.max(w, h); w = Math.round(w*s); h = Math.round(h*s);
+    const c = document.createElement('canvas'); c.width=w; c.height=h;
+    c.getContext('2d').drawImage(img, 0, 0, w, h);
+    res(c.toDataURL('image/jpeg', 0.85));
+  };
+  img.src = b64;
+});
+
 const SAMPLE_TRIPS = [
   { id:'t1', title:'방콕 가족여행', country:'태국', flag:'🇹🇭', startDate:'2026-01-15', endDate:'2026-01-19', currency:'THB', accent:'#134E4A', coverImage:null,
     days: dateRange('2026-01-15','2026-01-19').map(date=>({ date, waypoints:[], diary:'', photos:[], expenses:[] })) },
@@ -117,16 +135,63 @@ export default function TravelStudio() {
   const [tab, setTab]         = useState('library');
   const [trips, setTrips]     = useState(initial.trips || SAMPLE_TRIPS);
   const [selTrip, setSelTrip] = useState(null);
+  const [selDay, setSelDay]   = useState(null);  // ★ 일자별 편집 진입
   const [showNew, setShowNew] = useState(false);
+  const [editingTrip, setEditingTrip] = useState(null);  // ★ 여행 수정 모달
   const [syncCode, setSyncCode] = useState(initial.syncCode || '');
   const [showSync, setShowSync] = useState(false);
   const [apiKey, setApiKey]   = useState(initial.apiKey || '');
   const [sample, setSample]   = useState(initial.sample || DEFAULT_SAMPLE);
+  const [cloudStatus, setCloudStatus] = useState('idle'); // idle | syncing | ok | error | nofb
+  const [suppressSave, setSuppressSave] = useState(false); // Firebase에서 받은 데이터로 덮어쓸 때 다시 저장 방지
 
-  // 변경 시 localStorage 저장 (apiKey/sample/syncCode/trips)
+  // ─── Firebase 동기화 ──────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!syncCode || !fb.isFirebaseConfigured()) {
+      setCloudStatus(fb.isFirebaseConfigured() ? 'idle' : 'nofb');
+      return;
+    }
+    let unsubscribe;
+    let cancelled = false;
+    setCloudStatus('syncing');
+
+    (async () => {
+      try {
+        unsubscribe = await fb.fbSubscribe(syncCode, (data) => {
+          if (cancelled) return;
+          if (data?.trips) {
+            setSuppressSave(true);
+            setTrips(data.trips);
+            if (data.sample) setSample(data.sample);
+            setTimeout(() => setSuppressSave(false), 100);
+          }
+          setCloudStatus('ok');
+        });
+      } catch (err) {
+        console.error('Firebase 구독 실패:', err);
+        setCloudStatus('error');
+      }
+    })();
+
+    return () => { cancelled = true; if (unsubscribe) unsubscribe(); };
+  }, [syncCode]);
+
+  // 변경 시 localStorage + Firebase 저장
+  useEffect(() => {
+    if (suppressSave) return;
+    saveLS({ trips, syncCode, apiKey, sample });
+    if (syncCode && fb.isFirebaseConfigured()) {
+      fb.fbSave(syncCode, { trips, sample }).catch(err => {
+        console.error('Firebase 저장 실패:', err);
+        setCloudStatus('error');
+      });
+    }
+  }, [trips, sample]);  // syncCode/apiKey 변경 시에는 저장 안 함 (무한 루프 방지)
+
+  // syncCode/apiKey만 변경된 경우 localStorage만 업데이트
   useEffect(() => {
     saveLS({ trips, syncCode, apiKey, sample });
-  }, [trips, syncCode, apiKey, sample]);
+  }, [syncCode, apiKey]);
 
   useEffect(() => {
     const link = document.createElement('link');
@@ -136,12 +201,18 @@ export default function TravelStudio() {
     return () => { try { document.head.removeChild(link); } catch {} };
   }, []);
 
-  const stats = useMemo(() => {
-    const places = new Set();
-    let days = 0;
-    trips.forEach(t => safeArr(t.days).forEach(d => { days++; safeArr(d.waypoints).forEach(w => w.name && places.add(w.name)); }));
-    return { trips: trips.length, days, places: places.size };
-  }, [trips]);
+  // ─── Trip CRUD 헬퍼 ──────────────────────────────────────────────────────
+  const updateTrip = (tripId, updater) => {
+    setTrips(prev => prev.map(t => t.id === tripId ? (typeof updater === 'function' ? updater(t) : { ...t, ...updater }) : t));
+    if (selTrip?.id === tripId) {
+      setSelTrip(prev => prev ? (typeof updater === 'function' ? updater(prev) : { ...prev, ...updater }) : prev);
+    }
+  };
+  const deleteTrip = (tripId) => {
+    if (!confirm('이 여행을 삭제하시겠습니까? 모든 일자별 기록도 함께 삭제됩니다.')) return;
+    setTrips(prev => prev.filter(t => t.id !== tripId));
+    if (selTrip?.id === tripId) setSelTrip(null);
+  };
 
   return (
     <div style={{ minHeight:'100vh', background:T.bg, fontFamily:T.bodyFont, color:T.ink }}>
@@ -157,6 +228,7 @@ export default function TravelStudio() {
         @keyframes fadeUp { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
         .ts-card { transition:transform .2s,box-shadow .2s; }
         .ts-card:hover { transform:translateY(-2px); box-shadow:0 12px 32px rgba(28,25,23,.08); }
+        .ts-card:hover .ts-cover-img { transform:scale(1.04); }
         button:hover:not(:disabled) { opacity:.92; }
         button:disabled { opacity:.5; cursor:not-allowed; }
       `}</style>
@@ -195,15 +267,35 @@ export default function TravelStudio() {
       {/* ── 탭 콘텐츠 ── */}
       <div style={{ maxWidth:T.maxW, margin:'0 auto', padding:'40px 20px 80px' }}>
         {tab==='library' && (
-          <Library
-            trips={trips} stats={stats} syncCode={syncCode}
-            onSyncOpen={() => setShowSync(true)}
-            onSelect={t => { setSelTrip(t); }}
-            onNew={() => setShowNew(true)}
-            selectedTrip={selTrip}
-            onBack={() => setSelTrip(null)}
-            onBlogFromTrip={t => { setSelTrip(null); setTab('blog'); }}
-          />
+          selDay ? (
+            <DayEditor
+              trip={selTrip}
+              dayIndex={selDay}
+              syncCode={syncCode}
+              apiKey={apiKey}
+              onUpdateDay={(dayUpdater) => {
+                updateTrip(selTrip.id, t => ({
+                  ...t,
+                  days: t.days.map((d, i) => i === selDay ? (typeof dayUpdater === 'function' ? dayUpdater(d) : { ...d, ...dayUpdater }) : d),
+                }));
+              }}
+              onBack={() => setSelDay(null)}
+            />
+          ) : (
+            <Library
+              trips={trips} cloudStatus={cloudStatus} syncCode={syncCode}
+              onSyncOpen={() => setShowSync(true)}
+              onSelect={t => { setSelTrip(t); }}
+              onNew={() => setShowNew(true)}
+              selectedTrip={selTrip}
+              onBack={() => setSelTrip(null)}
+              onBlogFromTrip={t => { setSelTrip(null); setTab('blog'); }}
+              onEditTrip={(t) => setEditingTrip(t)}
+              onDeleteTrip={deleteTrip}
+              onUpdateTrip={updateTrip}
+              onSelectDay={(idx) => setSelDay(idx)}
+            />
+          )
         )}
         {tab==='blog' && (
           <BlogWriter
@@ -216,14 +308,23 @@ export default function TravelStudio() {
           <StyleSamples sample={sample} onChange={setSample} />
         )}
         {tab==='settings' && (
-          <SettingsTab apiKey={apiKey} onChange={setApiKey} />
+          <SettingsTab apiKey={apiKey} onChange={setApiKey} cloudStatus={cloudStatus} syncCode={syncCode} />
         )}
       </div>
 
       {showNew && (
-        <NewTripModal
+        <TripFormModal
+          mode="create"
           onClose={() => setShowNew(false)}
-          onCreate={t => { setTrips(p => [t, ...p]); setShowNew(false); setSelTrip(t); }}
+          onSave={t => { setTrips(p => [t, ...p]); setShowNew(false); setSelTrip(t); }}
+        />
+      )}
+      {editingTrip && (
+        <TripFormModal
+          mode="edit"
+          trip={editingTrip}
+          onClose={() => setEditingTrip(null)}
+          onSave={(updated) => { updateTrip(editingTrip.id, updated); setEditingTrip(null); }}
         />
       )}
       {showSync && (
@@ -236,8 +337,26 @@ export default function TravelStudio() {
 // =============================================================================
 // LIBRARY
 // =============================================================================
-function Library({ trips, stats, syncCode, onSyncOpen, onSelect, onNew, selectedTrip, onBack, onBlogFromTrip }) {
-  if (selectedTrip) return <TripDetail trip={selectedTrip} onBack={onBack} onBlog={onBlogFromTrip} />;
+function Library({ trips, cloudStatus, syncCode, onSyncOpen, onSelect, onNew, selectedTrip, onBack, onBlogFromTrip, onEditTrip, onDeleteTrip, onUpdateTrip, onSelectDay }) {
+  // stats 계산 (메인에서 prop으로 받지 않고 여기서)
+  const stats = useMemo(() => {
+    const places = new Set();
+    let days = 0;
+    trips.forEach(t => safeArr(t.days).forEach(d => { days++; safeArr(d.waypoints).forEach(w => w.name && places.add(w.name)); }));
+    return { trips: trips.length, days, places: places.size };
+  }, [trips]);
+
+  if (selectedTrip) {
+    return <TripDetail
+      trip={selectedTrip}
+      onBack={onBack}
+      onBlog={onBlogFromTrip}
+      onEdit={() => onEditTrip(selectedTrip)}
+      onDelete={() => onDeleteTrip(selectedTrip.id)}
+      onUpdateTrip={onUpdateTrip}
+      onSelectDay={onSelectDay}
+    />;
+  }
   return (
     <>
       <header style={{ marginBottom:32, display:'flex', justifyContent:'space-between', alignItems:'flex-start', gap:16, flexWrap:'wrap' }}>
@@ -247,9 +366,9 @@ function Library({ trips, stats, syncCode, onSyncOpen, onSelect, onNew, selected
           <p style={css.lead}>동선·일기·사진·지출을 기록하고, 블로그 글까지 한 번에.</p>
         </div>
         <button onClick={onSyncOpen} style={{ display:'inline-flex', alignItems:'center', gap:6, padding:'7px 13px', background:T.card, border:`1px solid ${T.border}`, borderRadius:99, fontFamily:T.sansFont, fontSize:11, color:T.sub, cursor:'pointer' }}>
-          {syncCode ? <Cloud size={12}/> : <CloudOff size={12}/>}
+          {cloudStatus==='ok' ? <Cloud size={12} color={T.success}/> : <CloudOff size={12}/>}
           <span>{syncCode || '동기화'}</span>
-          <span style={{ width:6, height:6, borderRadius:'50%', background: syncCode ? T.success : '#CBD5E0', display:'inline-block' }}/>
+          <CloudStatusDot status={cloudStatus}/>
         </button>
       </header>
 
@@ -288,55 +407,418 @@ function Library({ trips, stats, syncCode, onSyncOpen, onSelect, onNew, selected
 function TripCard({ trip, onClick }) {
   const days = safeArr(trip.days).length;
   const accent = trip.accent || T.accent;
+  const cover  = trip.coverImage;
+
   return (
-    <article onClick={onClick} className="ts-card" style={{ background:T.card, border:`1px solid ${T.border}`, borderRadius:4, overflow:'hidden', cursor:'pointer', boxShadow:'0 1px 3px rgba(28,25,23,.04)' }}>
-      <div style={{ aspectRatio:'16/10', background: trip.coverImage?`url(${trip.coverImage}) center/cover`:accent, position:'relative', display:'flex', alignItems:'flex-end', padding:'18px 20px', color:'#FAF7F2' }}>
-        {!trip.coverImage && <div style={{ position:'absolute', top:14, right:16, fontSize:34, filter:'drop-shadow(0 2px 6px rgba(0,0,0,.3))' }}>{trip.flag||'✈'}</div>}
-        {trip.coverImage && <div style={{ position:'absolute', inset:0, background:'linear-gradient(to top,rgba(0,0,0,.7),transparent 60%)' }}/>}
-        <div style={{ position:'relative', zIndex:1 }}>
-          <div style={{ fontFamily:T.sansFont, fontSize:10, letterSpacing:'0.16em', textTransform:'uppercase', opacity:.8, marginBottom:4 }}>{trip.country}</div>
-          <h3 style={{ fontFamily:T.displayFont, fontSize:22, fontWeight:500, margin:0, lineHeight:1.15 }}>{trip.title}</h3>
-        </div>
-      </div>
-      <div style={{ padding:'12px 18px 14px' }}>
-        <div style={{ fontFamily:T.sansFont, fontSize:12, color:T.sub, display:'flex', alignItems:'center', gap:8 }}>
-          <span>{fmtShort(trip.startDate)} – {fmtShort(trip.endDate)}</span>
-          <span style={{ opacity:.4 }}>·</span>
-          <span>{days}일</span>
-          <ChevronRight size={11} style={{ marginLeft:'auto', color:T.accent }}/>
+    <article onClick={onClick} className="ts-card" style={{
+      background:T.card, border:`1px solid ${T.border}`, borderRadius:6, overflow:'hidden',
+      cursor:'pointer', boxShadow:'0 1px 3px rgba(28,25,23,.05)', position:'relative',
+    }}>
+      <div style={{
+        aspectRatio:'4/5', background: cover ? '#000' : accent,
+        position:'relative', display:'flex', alignItems:'flex-end',
+        padding:'22px 22px 26px', color:'#FAF7F2', overflow:'hidden',
+      }}>
+        {cover ? (
+          <>
+            <img src={cover} alt="" style={{
+              position:'absolute', inset:0, width:'100%', height:'100%',
+              objectFit:'cover', transition:'transform .6s ease',
+            }} className="ts-cover-img"/>
+            {/* 듀얼 그라디언트 — 위에서 살짝, 아래는 진하게 */}
+            <div style={{
+              position:'absolute', inset:0,
+              background:'linear-gradient(to bottom, rgba(0,0,0,.25) 0%, transparent 30%, transparent 50%, rgba(0,0,0,.85) 100%)',
+            }}/>
+          </>
+        ) : (
+          <>
+            {/* 솔리드 폴백 — 우상단 라이트, 좌하단 다크 */}
+            <div style={{
+              position:'absolute', inset:0,
+              background:'radial-gradient(ellipse at top right, rgba(255,255,255,.12), transparent 55%)',
+            }}/>
+            <div style={{
+              position:'absolute', top:18, right:20, fontSize:38, opacity:.95,
+              filter:'drop-shadow(0 2px 8px rgba(0,0,0,.4))',
+            }}>{trip.flag||'✈'}</div>
+          </>
+        )}
+
+        {/* 표지 사진이 있을 때도 우상단에 작은 국기 뱃지 */}
+        {cover && (
+          <div style={{
+            position:'absolute', top:14, right:14, padding:'5px 10px',
+            background:'rgba(0,0,0,.5)', backdropFilter:'blur(8px)',
+            WebkitBackdropFilter:'blur(8px)',
+            borderRadius:99, fontSize:14, display:'inline-flex', alignItems:'center', gap:5,
+          }}>
+            <span>{trip.flag || '✈'}</span>
+            <span style={{ fontFamily:T.sansFont, fontSize:10, fontWeight:500, letterSpacing:'0.08em' }}>{trip.country}</span>
+          </div>
+        )}
+
+        <div style={{ position:'relative', zIndex:1, width:'100%' }}>
+          {!cover && (
+            <div style={{ fontFamily:T.sansFont, fontSize:10, letterSpacing:'0.18em', textTransform:'uppercase', opacity:.85, marginBottom:6 }}>
+              {trip.country}
+            </div>
+          )}
+          <h3 style={{
+            fontFamily:T.displayFont, fontSize:24, fontWeight:500,
+            margin:0, lineHeight:1.15, letterSpacing:'-0.01em',
+            textShadow: cover ? '0 2px 12px rgba(0,0,0,.4)' : 'none',
+          }}>
+            {trip.title}
+          </h3>
+          <div style={{
+            fontFamily:T.sansFont, fontSize:11, color:'rgba(255,255,255,.85)',
+            marginTop:8, display:'flex', alignItems:'center', gap:8,
+          }}>
+            <span>{fmtShort(trip.startDate)} – {fmtShort(trip.endDate)}</span>
+            <span style={{ opacity:.5 }}>·</span>
+            <span>{days}일</span>
+          </div>
         </div>
       </div>
     </article>
   );
 }
 
-function TripDetail({ trip, onBack, onBlog }) {
+function TripDetail({ trip, onBack, onBlog, onEdit, onDelete, onUpdateTrip, onSelectDay }) {
+  const fileRef = useRef(null);
+
+  const handleCoverUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const raw = await fileToB64(file);
+    const img = await resizeImg(raw, 1600);
+    onUpdateTrip(trip.id, { coverImage: img });
+    if (e.target) e.target.value = '';
+  };
+
   return (
     <>
-      <button onClick={onBack} style={{ ...css.secondaryBtn, marginBottom:24, fontSize:12 }}>← 라이브러리</button>
-      <div style={{ aspectRatio:'21/9', background: trip.coverImage?`url(${trip.coverImage}) center/cover`:trip.accent, borderRadius:4, overflow:'hidden', marginBottom:28, position:'relative', display:'flex', alignItems:'flex-end', padding:28, color:'#FAF7F2' }}>
-        {!trip.coverImage && <div style={{ position:'absolute', top:20, right:24, fontSize:56, filter:'drop-shadow(0 4px 12px rgba(0,0,0,.35))' }}>{trip.flag}</div>}
-        {trip.coverImage && <div style={{ position:'absolute', inset:0, background:'linear-gradient(to top,rgba(0,0,0,.72),transparent 55%)' }}/>}
-        <div style={{ position:'relative', zIndex:1 }}>
-          <div style={{ fontFamily:T.sansFont, fontSize:10, letterSpacing:'0.2em', textTransform:'uppercase', opacity:.8, marginBottom:6 }}>{trip.country} · {fmtShort(trip.startDate)} – {fmtShort(trip.endDate)}</div>
-          <h1 style={{ fontFamily:T.displayFont, fontSize:40, fontWeight:500, margin:0, lineHeight:1.05 }}>{trip.title}</h1>
+      <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:24 }}>
+        <button onClick={onBack} style={{ ...css.secondaryBtn, fontSize:12 }}><ArrowLeft size={12}/> 라이브러리</button>
+        <div style={{ marginLeft:'auto', display:'flex', gap:6 }}>
+          <button onClick={onEdit} style={{ ...css.secondaryBtn, fontSize:12 }}><Edit3 size={12}/> 여행 정보 수정</button>
+          <button onClick={onDelete} style={{ ...css.secondaryBtn, fontSize:12, color:T.danger, borderColor:'#FCA5A5' }}><Trash2 size={12}/></button>
         </div>
       </div>
+
+      {/* Hero with editable cover */}
+      <div style={{
+        aspectRatio:'21/9', background: trip.coverImage?'#000':trip.accent,
+        borderRadius:6, overflow:'hidden', marginBottom:14, position:'relative',
+        display:'flex', alignItems:'flex-end', padding:32, color:'#FAF7F2',
+      }}>
+        {trip.coverImage ? (
+          <>
+            <img src={trip.coverImage} alt="" style={{ position:'absolute', inset:0, width:'100%', height:'100%', objectFit:'cover' }}/>
+            <div style={{ position:'absolute', inset:0, background:'linear-gradient(to top, rgba(0,0,0,.78) 0%, rgba(0,0,0,.15) 50%, transparent 100%)' }}/>
+          </>
+        ) : (
+          <>
+            <div style={{ position:'absolute', inset:0, background:'radial-gradient(ellipse at top right, rgba(255,255,255,.1), transparent 60%)' }}/>
+            <div style={{ position:'absolute', top:20, right:24, fontSize:56, filter:'drop-shadow(0 4px 12px rgba(0,0,0,.35))' }}>{trip.flag}</div>
+          </>
+        )}
+        <div style={{ position:'relative', zIndex:1 }}>
+          <div style={{ fontFamily:T.sansFont, fontSize:10, letterSpacing:'0.2em', textTransform:'uppercase', opacity:.85, marginBottom:6 }}>{trip.country} · {fmtShort(trip.startDate)} – {fmtShort(trip.endDate)}</div>
+          <h1 style={{ fontFamily:T.displayFont, fontSize:40, fontWeight:500, margin:0, lineHeight:1.05, textShadow: trip.coverImage?'0 2px 16px rgba(0,0,0,.4)':'none' }}>{trip.title}</h1>
+        </div>
+        <button
+          onClick={() => fileRef.current?.click()}
+          style={{
+            position:'absolute', top:16, left:16, padding:'7px 12px',
+            background:'rgba(0,0,0,.55)', backdropFilter:'blur(8px)',
+            WebkitBackdropFilter:'blur(8px)',
+            border:'1px solid rgba(255,255,255,.18)', borderRadius:3,
+            color:'#FAF7F2', fontFamily:T.sansFont, fontSize:11, fontWeight:500,
+            cursor:'pointer', display:'inline-flex', alignItems:'center', gap:6,
+          }}
+        >
+          <ImageIcon size={12}/> {trip.coverImage ? '표지 변경' : '표지 사진 추가'}
+        </button>
+        {trip.coverImage && (
+          <button
+            onClick={() => onUpdateTrip(trip.id, { coverImage:null })}
+            style={{
+              position:'absolute', top:16, left:140, padding:'7px 10px',
+              background:'rgba(0,0,0,.55)', backdropFilter:'blur(8px)',
+              WebkitBackdropFilter:'blur(8px)',
+              border:'1px solid rgba(255,255,255,.18)', borderRadius:3,
+              color:'#FAF7F2', cursor:'pointer', display:'inline-flex',
+            }}
+            title="표지 사진 제거"
+          >
+            <X size={12}/>
+          </button>
+        )}
+        <input ref={fileRef} type="file" accept="image/*" onChange={handleCoverUpload} style={{ display:'none' }}/>
+      </div>
+
       <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:14 }}>
         <h2 style={css.sectionH}>일자별 기록</h2>
         <button onClick={() => onBlog(trip)} style={css.primaryBtn}><Edit3 size={13}/> 블로그 글로 만들기</button>
       </div>
       <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
-        {safeArr(trip.days).map((d, i) => (
-          <div key={d.date} style={{ background:T.card, border:`1px solid ${T.border}`, borderLeft:`3px solid ${T.accent}`, borderRadius:4, padding:'16px 20px' }}>
-            <div style={{ fontFamily:T.sansFont, fontSize:10, letterSpacing:'0.16em', textTransform:'uppercase', color:T.sub, marginBottom:2 }}>Day {String(i+1).padStart(2,'0')}</div>
-            <div style={{ fontFamily:T.displayFont, fontStyle:'italic', fontSize:16, color:T.ink }}>
-              {new Date(d.date).toLocaleDateString('ko-KR',{month:'long',day:'numeric',weekday:'short'})}
+        {safeArr(trip.days).map((d, i) => {
+          const wpCount = safeArr(d.waypoints).filter(w => w.name).length;
+          const photoCount = safeArr(d.photos).length;
+          const expCount = safeArr(d.expenses).length;
+          const hasContent = wpCount || d.diary || photoCount || expCount;
+
+          return (
+            <div
+              key={d.date}
+              onClick={() => onSelectDay(i)}
+              className="ts-card"
+              style={{
+                background:T.card, border:`1px solid ${T.border}`, borderLeft:`3px solid ${T.accent}`,
+                borderRadius:4, padding:'16px 20px', cursor:'pointer',
+                display:'flex', alignItems:'center', gap:14,
+              }}
+            >
+              <div style={{ flex:1 }}>
+                <div style={{ fontFamily:T.sansFont, fontSize:10, letterSpacing:'0.16em', textTransform:'uppercase', color:T.sub, marginBottom:2 }}>Day {String(i+1).padStart(2,'0')}</div>
+                <div style={{ fontFamily:T.displayFont, fontStyle:'italic', fontSize:16, color:T.ink }}>
+                  {new Date(d.date).toLocaleDateString('ko-KR',{month:'long',day:'numeric',weekday:'short'})}
+                </div>
+                {hasContent ? (
+                  <div style={{ marginTop:6, display:'flex', gap:12, flexWrap:'wrap', fontFamily:T.sansFont, fontSize:11, color:T.sub }}>
+                    {wpCount > 0 && <span><MapPin size={10} style={{verticalAlign:-1}}/> {wpCount}곳</span>}
+                    {photoCount > 0 && <span><Camera size={10} style={{verticalAlign:-1}}/> {photoCount}장</span>}
+                    {d.diary && <span><BookOpen size={10} style={{verticalAlign:-1}}/> 일기 {d.diary.length}자</span>}
+                    {expCount > 0 && <span><Briefcase size={10} style={{verticalAlign:-1}}/> 지출 {expCount}건</span>}
+                  </div>
+                ) : (
+                  <div style={{ marginTop:4, fontFamily:T.sansFont, fontSize:11, color:T.sub, fontStyle:'italic' }}>비어있음 — 탭하여 입력</div>
+                )}
+              </div>
+              {/* 첫 사진 미니 썸네일 */}
+              {photoCount > 0 && (
+                <img src={safeArr(d.photos)[0]?.url || safeArr(d.photos)[0]} alt="" style={{ width:48, height:48, objectFit:'cover', borderRadius:3, border:`1px solid ${T.border}` }}/>
+              )}
+              <ChevronRight size={14} color={T.sub}/>
             </div>
-            <div style={{ marginTop:6, fontFamily:T.sansFont, fontSize:12, color:T.sub, fontStyle:'italic' }}>Phase 2에서 동선·일기·사진·지출 입력 가능</div>
-          </div>
-        ))}
+          );
+        })}
       </div>
+    </>
+  );
+}
+
+// ─── CloudStatusDot ────────────────────────────────────────────────────────
+function CloudStatusDot({ status }) {
+  const map = {
+    idle:    { color:'#CBD5E0', title:'동기화 안 됨' },
+    syncing: { color:'#F6AD55', title:'동기화 중' },
+    ok:      { color:T.success, title:'동기화 됨' },
+    error:   { color:T.danger,  title:'동기화 오류' },
+    nofb:    { color:'#CBD5E0', title:'Firebase 미설정' },
+  };
+  const s = map[status] || map.idle;
+  return <span title={s.title} style={{ width:6, height:6, borderRadius:'50%', background:s.color, display:'inline-block' }}/>;
+}
+
+// =============================================================================
+// DAY EDITOR — 일자별 입력 (간단 버전)
+// =============================================================================
+function DayEditor({ trip, dayIndex, syncCode, apiKey, onUpdateDay, onBack }) {
+  const day = safeArr(trip.days)[dayIndex];
+  if (!day) return <div>일자를 찾을 수 없습니다.</div>;
+
+  const [uploading, setUploading] = useState(false);
+  const [pickingGP, setPickingGP] = useState(false);
+  const fileRef = useRef(null);
+
+  // 사진 업로드 — Firebase Storage 사용 가능하면 그쪽으로, 아니면 base64 localStorage
+  const uploadPhotos = async (files) => {
+    if (!files?.length) return;
+    setUploading(true);
+    try {
+      const newPhotos = [];
+      for (const file of files) {
+        if (syncCode && fb.isFirebaseConfigured()) {
+          // Firebase Storage 업로드
+          const { url, path } = await fb.fbUploadPhoto(syncCode, trip.id, file);
+          newPhotos.push({ url, path, addedAt: Date.now() });
+        } else {
+          // localStorage 폴백 — base64
+          const raw = await fileToB64(file);
+          const img = await resizeImg(raw, 1280);
+          newPhotos.push({ url: img, path: null, addedAt: Date.now() });
+        }
+      }
+      onUpdateDay(d => ({ ...d, photos: [...safeArr(d.photos), ...newPhotos] }));
+    } catch (err) {
+      alert('사진 업로드 실패: ' + err.message);
+    }
+    setUploading(false);
+  };
+
+  const handleFileInput = async (e) => {
+    const files = Array.from(e.target.files || []);
+    await uploadPhotos(files);
+    if (e.target) e.target.value = '';
+  };
+
+  const handleDrop = async (e) => {
+    e.preventDefault();
+    const files = Array.from(e.dataTransfer.files || []);
+    await uploadPhotos(files);
+  };
+
+  const removePhoto = async (idx) => {
+    if (!confirm('이 사진을 삭제하시겠습니까?')) return;
+    const photo = safeArr(day.photos)[idx];
+    if (photo?.path) {
+      try { await fb.fbDeletePhoto(photo.path); } catch {}
+    }
+    onUpdateDay(d => ({ ...d, photos: safeArr(d.photos).filter((_, i) => i !== idx) }));
+  };
+
+  // Google Photos에서 가져오기
+  const importFromGooglePhotos = async () => {
+    if (!gp.isGoogleConfigured()) {
+      alert('Google Photos 연동이 설정되지 않았습니다.\n설정 탭에서 Google Client ID 등록이 필요합니다.');
+      return;
+    }
+    setPickingGP(true);
+    try {
+      const items = await gp.pickFromGooglePhotos({
+        onSessionStart: () => alert('새 탭에서 Google Photos가 열립니다. 사진을 선택한 후 이 화면으로 돌아오세요.\n선택 완료까지 자동 감지됩니다.'),
+      });
+      if (!items?.length) { setPickingGP(false); return; }
+
+      const newPhotos = [];
+      for (const item of items) {
+        const blob = await gp.downloadPickedMedia(item);
+        const file = new File([blob], item.mediaFile?.filename || 'photo.jpg', { type: blob.type });
+        if (syncCode && fb.isFirebaseConfigured()) {
+          const { url, path } = await fb.fbUploadPhoto(syncCode, trip.id, file);
+          newPhotos.push({ url, path, addedAt: Date.now(), source: 'google-photos' });
+        } else {
+          const raw = await fileToB64(file);
+          const img = await resizeImg(raw, 1280);
+          newPhotos.push({ url: img, path: null, addedAt: Date.now(), source: 'google-photos' });
+        }
+      }
+      onUpdateDay(d => ({ ...d, photos: [...safeArr(d.photos), ...newPhotos] }));
+    } catch (err) {
+      alert('Google Photos 가져오기 실패: ' + err.message);
+    }
+    setPickingGP(false);
+  };
+
+  const photos = safeArr(day.photos);
+
+  return (
+    <>
+      <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:24, flexWrap:'wrap' }}>
+        <button onClick={onBack} style={{ ...css.secondaryBtn, fontSize:12 }}><ArrowLeft size={12}/> {trip.title}</button>
+        <div style={{ marginLeft:'auto', fontFamily:T.sansFont, fontSize:11, color:T.sub }}>
+          {syncCode && fb.isFirebaseConfigured()
+            ? <><Cloud size={11} style={{verticalAlign:-1, color:T.success}}/> 클라우드 저장</>
+            : <><CloudOff size={11} style={{verticalAlign:-1}}/> 이 기기에만 저장</>
+          }
+        </div>
+      </div>
+
+      <div style={{ marginBottom:32 }}>
+        <div style={{ fontFamily:T.sansFont, fontSize:11, letterSpacing:'0.18em', textTransform:'uppercase', color:T.sub, marginBottom:4, fontWeight:500 }}>
+          Day {String(dayIndex+1).padStart(2,'0')} · {trip.country}
+        </div>
+        <h1 style={{ ...css.hero, fontSize:34 }}>
+          {new Date(day.date).toLocaleDateString('ko-KR',{ year:'numeric', month:'long', day:'numeric', weekday:'long' })}
+        </h1>
+      </div>
+
+      {/* 일기 */}
+      <section style={{ marginBottom:24 }}>
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'baseline', marginBottom:10 }}>
+          <h2 style={css.sectionH}>일기</h2>
+          <span style={{ fontFamily:T.sansFont, fontSize:11, color:T.sub }}>{(day.diary || '').length}자</span>
+        </div>
+        <textarea
+          value={day.diary || ''}
+          onChange={e => onUpdateDay({ diary: e.target.value })}
+          placeholder="오늘의 느낌, 인상 깊었던 순간, 기억하고 싶은 디테일을 자유롭게…"
+          rows={6}
+          style={{ ...css.textarea, fontSize:15, lineHeight:1.7, padding:'14px 16px' }}
+        />
+      </section>
+
+      {/* 사진 */}
+      <section style={{ marginBottom:24 }}>
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'baseline', marginBottom:10 }}>
+          <h2 style={css.sectionH}>사진 {photos.length > 0 && <span style={{ fontFamily:T.sansFont, fontStyle:'normal', fontSize:14, color:T.sub, fontWeight:400 }}>· {photos.length}장</span>}</h2>
+          <div style={{ display:'flex', gap:6 }}>
+            {gp.isGoogleConfigured() && (
+              <button
+                onClick={importFromGooglePhotos}
+                disabled={pickingGP || uploading}
+                style={{ ...css.secondaryBtn, fontSize:11 }}
+              >
+                {pickingGP ? <><Loader2 size={11} className="spin"/> 가져오는 중…</> : <><ExternalLink size={11}/> Google Photos</>}
+              </button>
+            )}
+            <button onClick={() => fileRef.current?.click()} disabled={uploading} style={{ ...css.secondaryBtn, fontSize:11 }}>
+              {uploading ? <><Loader2 size={11} className="spin"/> 업로드…</> : <><Upload size={11}/> 사진 추가</>}
+            </button>
+            <input ref={fileRef} type="file" accept="image/*" multiple onChange={handleFileInput} style={{ display:'none' }}/>
+          </div>
+        </div>
+
+        {photos.length > 0 ? (
+          <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill, minmax(150px, 1fr))', gap:8 }}>
+            {photos.map((p, i) => (
+              <div key={i} style={{ position:'relative', aspectRatio:'1', borderRadius:3, overflow:'hidden', border:`1px solid ${T.border}` }}>
+                <img src={p.url || p} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }}/>
+                <button
+                  onClick={() => removePhoto(i)}
+                  style={{
+                    position:'absolute', top:4, right:4, padding:4,
+                    background:'rgba(0,0,0,.55)', border:'none', color:'#fff',
+                    borderRadius:3, cursor:'pointer', display:'inline-flex',
+                  }}
+                  title="삭제"
+                >
+                  <X size={12}/>
+                </button>
+                {p.source === 'google-photos' && (
+                  <div style={{ position:'absolute', bottom:4, left:4, padding:'2px 6px', background:'rgba(0,0,0,.55)', borderRadius:99, color:'#fff', fontSize:9, fontFamily:T.sansFont }}>
+                    G
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div
+            onClick={() => fileRef.current?.click()}
+            onDragOver={e => e.preventDefault()}
+            onDrop={handleDrop}
+            style={{ padding:'40px 16px', textAlign:'center', background:T.cardSoft, border:`2px dashed ${T.border}`, borderRadius:4, cursor:'pointer', fontFamily:T.sansFont, fontSize:13, color:T.sub, lineHeight:1.6 }}
+          >
+            <ImageIcon size={28} style={{ display:'block', margin:'0 auto 10px', opacity:.4 }}/>
+            <strong style={{ color:T.ink, fontWeight:500 }}>사진을 추가하세요</strong>
+            <div style={{ marginTop:4 }}>클릭하거나 이 영역에 드롭</div>
+          </div>
+        )}
+      </section>
+
+      {/* 메모 (간단 버전 — Phase 2에서 동선/지출 추가 예정) */}
+      <section>
+        <div style={{ background:T.accentSoft, border:`1px solid ${T.accentLight}`, borderRadius:4, padding:'14px 18px' }}>
+          <div style={{ fontFamily:T.sansFont, fontSize:11, color:T.accent, fontWeight:600, marginBottom:6 }}>📌 다음 업데이트 예정</div>
+          <div style={{ fontFamily:T.sansFont, fontSize:11, color:T.sub, lineHeight:1.7 }}>
+            동선(waypoint) 편집기 · 지출 입력 · 환율 자동 환산 · 라우트 타임라인 JPG 내보내기
+          </div>
+        </div>
+      </section>
     </>
   );
 }
@@ -377,20 +859,6 @@ function BlogWriter({ apiKey, sample, onNeedKey }) {
       return true;
     } catch { setFaceApiState('error'); return false; }
   };
-
-  const fileToB64 = (f) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(f); });
-  const resizeImg = (b64, max=1280) => new Promise(res => {
-    const img = new Image();
-    img.onload = () => {
-      let { width: w, height: h } = img;
-      if (Math.max(w, h) <= max) { res(b64); return; }
-      const s = max / Math.max(w, h); w = Math.round(w*s); h = Math.round(h*s);
-      const c = document.createElement('canvas'); c.width=w; c.height=h;
-      c.getContext('2d').drawImage(img, 0, 0, w, h);
-      res(c.toDataURL('image/jpeg', 0.85));
-    };
-    img.src = b64;
-  });
 
   const handleUpload = async (e) => {
     const files = Array.from(e.target.files || []);
@@ -876,8 +1344,10 @@ function StyleSamples({ sample, onChange }) {
 // =============================================================================
 // SETTINGS 탭
 // =============================================================================
-function SettingsTab({ apiKey, onChange }) {
+function SettingsTab({ apiKey, onChange, cloudStatus, syncCode }) {
   const [show, setShow] = useState(false);
+  const fbReady = fb.isFirebaseConfigured();
+  const gpReady = gp.isGoogleConfigured();
 
   const handleExport = () => {
     const data = loadLS() || {};
@@ -901,39 +1371,89 @@ function SettingsTab({ apiKey, onChange }) {
     <>
       <div style={{ marginBottom:28 }}>
         <div style={css.eyebrow}>설정</div>
-        <h1 style={css.hero}><span style={{ fontStyle:'italic', color:T.accent }}>API</span> 설정</h1>
+        <h1 style={css.hero}><span style={{ fontStyle:'italic', color:T.accent }}>API</span> · 동기화 설정</h1>
       </div>
-      <div style={{ background:T.card, border:`1px solid ${T.border}`, borderRadius:4, padding:24, marginBottom:16 }}>
-        <label style={css.label}>Google Gemini API Key</label>
-        <div style={{ display:'flex', gap:8 }}>
+
+      {/* Gemini */}
+      <div style={{ background:T.card, border:`1px solid ${T.border}`, borderRadius:4, padding:24, marginBottom:14 }}>
+        <div style={css.label}>① Google Gemini API Key (필수)</div>
+        <div style={{ display:'flex', gap:8, marginTop:6 }}>
           <input type={show?'text':'password'} style={{ ...css.input, flex:1 }} placeholder="AIza…" value={apiKey} onChange={e=>onChange(e.target.value)}/>
           <button style={css.secondaryBtn} onClick={()=>setShow(p=>!p)}>{show ? <EyeOff size={13}/> : <Eye size={13}/>}</button>
         </div>
         <p style={{ fontFamily:T.sansFont, fontSize:11, color:T.sub, marginTop:8, lineHeight:1.7 }}>
-          <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer" style={{ color:T.accent }}>aistudio.google.com/apikey</a>
-          에서 무료 발급. 키는 브라우저 localStorage에만 저장되며, 서버로 전송되지 않습니다.
+          <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer" style={{ color:T.accent }}>aistudio.google.com/apikey</a> 무료 발급 · 분당 15회 / 일 1,500회
         </p>
-        {apiKey && <div style={{ marginTop:12, display:'inline-flex', alignItems:'center', gap:6, padding:'4px 12px', borderRadius:99, background:'#DCFCE7', color:'#166534', border:'1px solid #86EFAC', fontFamily:T.sansFont, fontSize:11 }}><Check size={11}/> API 키 입력됨</div>}
-        <hr style={{ border:'none', borderTop:`1px solid ${T.border}`, margin:'20px 0' }}/>
-        <div style={css.label}>Gemini 2.0 Flash 무료 한도</div>
-        <p style={{ fontFamily:T.sansFont, fontSize:12, color:T.sub, lineHeight:1.7, margin:0 }}>
-          분당 15회 (RPM) / 일 1,500회 (RPD)<br/>
-          사진 캡션 = 사진 수만큼 · 글 생성 = 1회 · SEO 분석 = 1회<br/>
-          사진 10장짜리 글 1편 ≈ 12회 호출 → 무료 한도 내 충분
+        {apiKey && <div style={{ marginTop:10, display:'inline-flex', alignItems:'center', gap:6, padding:'4px 12px', borderRadius:99, background:'#DCFCE7', color:'#166534', border:'1px solid #86EFAC', fontFamily:T.sansFont, fontSize:11 }}><Check size={11}/> 입력됨</div>}
+      </div>
+
+      {/* Firebase */}
+      <div style={{ background:T.card, border:`1px solid ${T.border}`, borderRadius:4, padding:24, marginBottom:14 }}>
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:6 }}>
+          <div style={css.label}>② Firebase 동기화 (선택)</div>
+          {fbReady ? (
+            <span style={{ display:'inline-flex', alignItems:'center', gap:6, padding:'3px 10px', borderRadius:99, background:'#DCFCE7', color:'#166534', border:'1px solid #86EFAC', fontFamily:T.sansFont, fontSize:11 }}>
+              <Check size={11}/> 설정됨
+              {syncCode && cloudStatus === 'ok' && <> · <Cloud size={11}/> {syncCode}</>}
+            </span>
+          ) : (
+            <span style={{ display:'inline-flex', alignItems:'center', gap:4, padding:'3px 10px', borderRadius:99, background:'#FEF3C7', color:'#92400E', border:'1px solid #FCD34D', fontFamily:T.sansFont, fontSize:11 }}>
+              <CloudOff size={11}/> 미설정
+            </span>
+          )}
+        </div>
+        <p style={{ fontFamily:T.sansFont, fontSize:12, color:T.sub, lineHeight:1.7, margin:'10px 0 0' }}>
+          어디서든 같은 데이터로 접속하려면 Firebase 연결 필요. <a href="https://console.firebase.google.com" target="_blank" rel="noreferrer" style={{ color:T.accent }}>console.firebase.google.com</a>에서 프로젝트를 만들고 다음 5개 환경변수를 <code style={{ padding:'1px 5px', background:T.cardSoft, borderRadius:3, fontSize:11 }}>.env.local</code> 또는 Vercel 환경변수에 등록:
+        </p>
+        <pre style={{ fontFamily:'monospace', fontSize:11, background:T.cardSoft, padding:'10px 14px', borderRadius:3, marginTop:8, color:T.ink, lineHeight:1.6, overflowX:'auto', border:`1px solid ${T.border}` }}>
+{`VITE_FIREBASE_API_KEY=AIza...
+VITE_FIREBASE_AUTH_DOMAIN=xxx.firebaseapp.com
+VITE_FIREBASE_PROJECT_ID=xxx
+VITE_FIREBASE_STORAGE_BUCKET=xxx.appspot.com
+VITE_FIREBASE_APP_ID=1:xxx:web:xxx`}
+        </pre>
+        <p style={{ fontFamily:T.sansFont, fontSize:11, color:T.sub, marginTop:8, lineHeight:1.6 }}>
+          Firebase 콘솔에서 Firestore Database + Storage 활성화 필요 · 무료 한도(Firestore 1GB · Storage 5GB)로 충분
         </p>
       </div>
 
+      {/* Google Photos */}
+      <div style={{ background:T.card, border:`1px solid ${T.border}`, borderRadius:4, padding:24, marginBottom:14 }}>
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:6 }}>
+          <div style={css.label}>③ Google Photos 가져오기 (선택)</div>
+          {gpReady ? (
+            <span style={{ display:'inline-flex', alignItems:'center', gap:6, padding:'3px 10px', borderRadius:99, background:'#DCFCE7', color:'#166534', border:'1px solid #86EFAC', fontFamily:T.sansFont, fontSize:11 }}><Check size={11}/> 설정됨</span>
+          ) : (
+            <span style={{ display:'inline-flex', alignItems:'center', gap:4, padding:'3px 10px', borderRadius:99, background:'#FEF3C7', color:'#92400E', border:'1px solid #FCD34D', fontFamily:T.sansFont, fontSize:11 }}>미설정</span>
+          )}
+        </div>
+        <p style={{ fontFamily:T.sansFont, fontSize:12, color:T.sub, lineHeight:1.7, margin:'10px 0 0' }}>
+          <a href="https://console.cloud.google.com" target="_blank" rel="noreferrer" style={{ color:T.accent }}>Google Cloud Console</a>에서:
+        </p>
+        <ol style={{ fontFamily:T.sansFont, fontSize:12, color:T.sub, lineHeight:1.8, margin:'6px 0 0', paddingLeft:18 }}>
+          <li>프로젝트 만들기 (Gemini와 같은 프로젝트 가능)</li>
+          <li>APIs &amp; Services → Library → <strong>Photos Picker API</strong> 활성화</li>
+          <li>Credentials → OAuth 2.0 Client ID 생성 (Web application)</li>
+          <li>Authorized JavaScript origins에 배포 도메인 등록 (예: <code>https://travel-studio.vercel.app</code>)</li>
+          <li>발급된 Client ID를 환경변수 <code>VITE_GOOGLE_CLIENT_ID</code>에 등록</li>
+        </ol>
+        <div style={{ marginTop:12, padding:'10px 14px', background:T.accentSoft, border:`1px solid ${T.accentLight}`, borderRadius:3, fontFamily:T.sansFont, fontSize:11, color:T.accent, lineHeight:1.6 }}>
+          ❗ <strong>네이버 마이박스</strong>는 외부 개발자 API가 공개되지 않아 직접 연동 불가능합니다. 마이박스 앱에서 사진을 일단 다운로드 후 본 앱에 업로드하거나, Google Photos / Firebase Storage로 백업해서 사용하세요.
+        </div>
+      </div>
+
+      {/* 데이터 관리 */}
       <div style={{ background:T.card, border:`1px solid ${T.border}`, borderRadius:4, padding:24 }}>
         <div style={css.label}>데이터 관리</div>
-        <p style={{ fontFamily:T.sansFont, fontSize:12, color:T.sub, lineHeight:1.7, margin:'0 0 14px' }}>
-          모든 데이터는 이 브라우저에만 저장됩니다. 다른 기기에서 보려면 백업 후 가져오기 필요.
+        <p style={{ fontFamily:T.sansFont, fontSize:12, color:T.sub, lineHeight:1.7, margin:'10px 0 14px' }}>
+          {fbReady && syncCode ? '클라우드(Firebase)와 이 브라우저에 모두 저장 중.' : '이 브라우저의 localStorage에만 저장 중. 다기기 사용을 원하면 Firebase 연결.'}
         </p>
         <div style={{ display:'flex', gap:8, flexWrap:'wrap' }}>
           <button onClick={handleExport} style={css.secondaryBtn}>
-            <Briefcase size={12}/> 데이터 내보내기 (JSON)
+            <Briefcase size={12}/> JSON 백업 내보내기
           </button>
           <button onClick={handleClear} style={{ ...css.secondaryBtn, color:T.danger, borderColor:'#FCA5A5' }}>
-            <Trash2 size={12}/> 모든 데이터 초기화
+            <Trash2 size={12}/> 로컬 데이터 초기화
           </button>
         </div>
       </div>
@@ -942,26 +1462,80 @@ function SettingsTab({ apiKey, onChange }) {
 }
 
 // =============================================================================
-// NEW TRIP MODAL
+// TRIP FORM MODAL (생성 + 수정 겸용)
 // =============================================================================
-function NewTripModal({ onClose, onCreate }) {
-  const [form, setForm] = useState({ title:'', country:'', flag:'', startDate:'', endDate:'', currency:'KRW', accent:ACCENTS[0].color });
+function TripFormModal({ mode, trip, onClose, onSave }) {
+  const isEdit = mode === 'edit';
+  const [form, setForm] = useState(isEdit ? {
+    title: trip.title || '',
+    country: trip.country || '',
+    flag: trip.flag || '',
+    startDate: trip.startDate || '',
+    endDate: trip.endDate || '',
+    currency: trip.currency || 'KRW',
+    accent: trip.accent || ACCENTS[0].color,
+    coverImage: trip.coverImage || null,
+  } : { title:'', country:'', flag:'', startDate:'', endDate:'', currency:'KRW', accent:ACCENTS[0].color, coverImage:null });
+
   const valid = form.title && form.startDate && form.endDate && new Date(form.endDate) >= new Date(form.startDate);
   const dc = valid ? dateRange(form.startDate, form.endDate).length : 0;
   const handleCountry = v => { const f=guessFlag(v); setForm({...form,country:v,flag:f||form.flag}); };
-  const create = () => {
-    if (!valid) return;
-    onCreate({ id:uid(), ...form, flag:form.flag||'✈', coverImage:null,
-      days: dateRange(form.startDate,form.endDate).map(date=>({date,waypoints:[],diary:'',photos:[],expenses:[]})) });
+
+  const handleCoverFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const raw = await fileToB64(file);
+    const img = await resizeImg(raw, 1600);
+    setForm({ ...form, coverImage: img });
+    if (e.target) e.target.value = '';
   };
+
+  const save = () => {
+    if (!valid) return;
+    if (isEdit) {
+      // 기존 trip의 days는 유지하고 메타만 업데이트 (날짜 변경 시 days 재생성)
+      const newDates = dateRange(form.startDate, form.endDate);
+      const oldDayMap = Object.fromEntries(safeArr(trip.days).map(d => [d.date, d]));
+      const newDays = newDates.map(date => oldDayMap[date] || { date, waypoints:[], diary:'', photos:[], expenses:[] });
+      onSave({ ...form, days: newDays });
+    } else {
+      onSave({
+        id: uid(), ...form, flag: form.flag || '✈',
+        days: dateRange(form.startDate, form.endDate).map(date => ({ date, waypoints:[], diary:'', photos:[], expenses:[] })),
+      });
+    }
+  };
+
   return (
     <div style={css.modalBackdrop} onClick={onClose}>
       <div style={css.modalCard} onClick={e=>e.stopPropagation()} className="fade-up">
         <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', padding:'22px 24px 14px' }}>
-          <div><div style={css.eyebrow}>New Journey</div><h2 style={{ fontFamily:T.displayFont, fontSize:24, fontWeight:500, margin:0, color:T.ink }}>새 여행 시작하기</h2></div>
+          <div>
+            <div style={css.eyebrow}>{isEdit ? 'Edit Journey' : 'New Journey'}</div>
+            <h2 style={{ fontFamily:T.displayFont, fontSize:24, fontWeight:500, margin:0, color:T.ink }}>
+              {isEdit ? '여행 정보 수정' : '새 여행 시작하기'}
+            </h2>
+          </div>
           <button onClick={onClose} style={{ background:'none', border:'none', cursor:'pointer', color:T.sub, padding:6, display:'inline-flex' }}><X size={16}/></button>
         </div>
         <div style={{ padding:'0 24px 8px', display:'flex', flexDirection:'column', gap:14 }}>
+          {/* 표지 사진 */}
+          <div>
+            <label style={css.label}>표지 사진 (선택)</label>
+            {form.coverImage ? (
+              <div style={{ position:'relative', borderRadius:4, overflow:'hidden', border:`1px solid ${T.border}`, aspectRatio:'21/9', background:'#000' }}>
+                <img src={form.coverImage} alt="" style={{ width:'100%', height:'100%', objectFit:'cover' }}/>
+                <button onClick={() => setForm({ ...form, coverImage:null })} style={{ position:'absolute', top:8, right:8, padding:6, background:'rgba(0,0,0,.6)', border:'none', color:'#fff', borderRadius:3, cursor:'pointer', display:'inline-flex' }}><X size={14}/></button>
+              </div>
+            ) : (
+              <label style={{ display:'block', padding:'24px 16px', textAlign:'center', background:T.cardSoft, border:`2px dashed ${T.border}`, borderRadius:4, cursor:'pointer', fontFamily:T.sansFont, fontSize:12, color:T.sub }}>
+                <ImageIcon size={20} style={{ display:'block', margin:'0 auto 6px', opacity:.5 }}/>
+                클릭하여 표지 사진 업로드
+                <input type="file" accept="image/*" onChange={handleCoverFile} style={{ display:'none' }}/>
+              </label>
+            )}
+          </div>
+
           <div><label style={css.label}>여행 제목</label><input style={css.input} placeholder="도쿄 벚꽃 여행 2026" value={form.title} onChange={e=>setForm({...form,title:e.target.value})} autoFocus/></div>
           <div style={{ display:'grid', gridTemplateColumns:'1fr 88px', gap:10 }}>
             <div>
@@ -978,7 +1552,7 @@ function NewTripModal({ onClose, onCreate }) {
           <div style={{ display:'grid', gridTemplateColumns:'110px 1fr', gap:14, alignItems:'flex-start' }}>
             <div><label style={css.label}>기본 통화</label><select style={css.input} value={form.currency} onChange={e=>setForm({...form,currency:e.target.value})}>{CURRENCIES.map(c=><option key={c} value={c}>{c}</option>)}</select></div>
             <div>
-              <label style={css.label}>표지 색상</label>
+              <label style={css.label}>표지 색상 (사진 없을 때)</label>
               <div style={{ display:'flex', gap:8, marginTop:4, flexWrap:'wrap' }}>
                 {ACCENTS.map(a=>(
                   <button key={a.id} onClick={()=>setForm({...form,accent:a.color})} title={a.label} style={{ width:28,height:28,borderRadius:3,background:a.color,padding:0,border:form.accent===a.color?`2px solid ${T.ink}`:`2px solid ${T.border}`,cursor:'pointer',boxShadow:form.accent===a.color?`0 0 0 2px ${T.bg},0 0 0 3px ${T.ink}`:'none' }}/>
@@ -989,7 +1563,9 @@ function NewTripModal({ onClose, onCreate }) {
         </div>
         <div style={{ display:'flex', gap:8, padding:'16px 24px 22px', borderTop:`1px solid ${T.border}`, marginTop:14 }}>
           <button onClick={onClose} style={css.secondaryBtn}>취소</button>
-          <button onClick={create} disabled={!valid} style={{ ...css.primaryBtn, flex:1, justifyContent:'center' }}>여행 만들기 <ChevronRight size={14}/></button>
+          <button onClick={save} disabled={!valid} style={{ ...css.primaryBtn, flex:1, justifyContent:'center' }}>
+            {isEdit ? '저장' : '여행 만들기'} <ChevronRight size={14}/>
+          </button>
         </div>
       </div>
     </div>
@@ -1001,15 +1577,23 @@ function NewTripModal({ onClose, onCreate }) {
 // =============================================================================
 function SyncPanel({ current, onClose, onApply }) {
   const [code, setCode] = useState(current||'');
+  const fbReady = fb.isFirebaseConfigured();
   return (
     <div style={css.modalBackdrop} onClick={onClose}>
-      <div style={{ ...css.modalCard, maxWidth:420 }} onClick={e=>e.stopPropagation()} className="fade-up">
+      <div style={{ ...css.modalCard, maxWidth:480 }} onClick={e=>e.stopPropagation()} className="fade-up">
         <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', padding:'22px 24px 14px' }}>
           <h2 style={{ fontFamily:T.displayFont, fontSize:22, fontWeight:500, margin:0, color:T.ink }}>클라우드 동기화</h2>
           <button onClick={onClose} style={{ background:'none', border:'none', cursor:'pointer', color:T.sub, padding:6, display:'inline-flex' }}><X size={16}/></button>
         </div>
         <div style={{ padding:'0 24px 20px' }}>
-          <p style={{ fontFamily:T.sansFont, fontSize:13, color:T.sub, lineHeight:1.7, margin:'0 0 14px' }}>모든 기기에서 같은 코드를 입력하면 실시간 동기화됩니다.</p>
+          {!fbReady && (
+            <div style={{ background:'#FEF3C7', border:`1px solid #FCD34D`, borderRadius:4, padding:'10px 14px', marginBottom:14, fontFamily:T.sansFont, fontSize:12, color:'#92400E', lineHeight:1.6 }}>
+              ⚠ Firebase가 설정되지 않아 이 기기에서만 데이터가 보존됩니다. 다기기 동기화를 원하면 Firebase 프로젝트를 만들고 .env에 키를 추가하세요. (설정 탭 참고)
+            </div>
+          )}
+          <p style={{ fontFamily:T.sansFont, fontSize:13, color:T.sub, lineHeight:1.7, margin:'0 0 14px' }}>
+            모든 기기에서 같은 코드를 입력하면 실시간 동기화됩니다. 추측하기 어려운 코드를 사용하세요.
+          </p>
           <label style={css.label}>코드</label>
           <input style={css.input} value={code} onChange={e=>setCode(e.target.value.toLowerCase().replace(/[^a-z0-9]/g,''))} placeholder="travel2026" maxLength={20}/>
           <div style={{ display:'flex', gap:8, marginTop:16 }}>

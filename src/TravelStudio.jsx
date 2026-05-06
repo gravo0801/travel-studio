@@ -315,6 +315,8 @@ export default function TravelStudio() {
   const [customRules, setCustomRules] = useState(init.customRules || DEFAULT_RULES);
   const [draftBlog, setDraftBlog] = useState(init.draftBlog || null);
   const [savedBlogs, setSavedBlogs] = useState(init.savedBlogs || []);
+  // DayEditor → BlogWriter로 데이터를 넘길 때 임시 보관 (저장 안 함)
+  const [blogSeed, setBlogSeed] = useState(null);
 
   // ── 파생 상태 ──
   const currentTrip = useMemo(
@@ -480,6 +482,13 @@ export default function TravelStudio() {
                 syncCode={syncCode}
                 onUpdate={updateDay}
                 onBack={() => setView(v => ({ ...v, dayIdx: null }))}
+                onBlog={(seed) => {
+                  if (draftBlog && draftBlog.scenes?.length > 0) {
+                    if (!confirm('블로그 작성 탭에 이미 작업 중인 글이 있습니다. 새 일자 데이터로 덮어쓰시겠습니까?\n\n(현재 작업은 사라집니다)')) return;
+                  }
+                  setBlogSeed(seed);
+                  setView(v => ({ ...v, tab: 'blog' }));
+                }}
               />
             );
           }
@@ -520,6 +529,8 @@ export default function TravelStudio() {
             onDraftChange={setDraftBlog}
             savedBlogs={savedBlogs}
             onSavedBlogsChange={setSavedBlogs}
+            seed={blogSeed}
+            onSeedConsumed={() => setBlogSeed(null)}
             onNeedKey={() => setView(v => ({ ...v, tab: 'settings' }))}
           />
         )}
@@ -931,9 +942,11 @@ function TripDetail({ trip, onBack, onBlog, onEdit, onDelete, onUpdateTrip, onSe
 // ============================================================================
 // DAY EDITOR — 일자별 입력 화면
 // ============================================================================
-function DayEditor({ trip, day, dayIdx, syncCode, onUpdate, onBack }) {
+function DayEditor({ trip, day, dayIdx, syncCode, onUpdate, onBack, onBlog }) {
   const [uploading, setUploading] = useState(false);
   const [pickingGP, setPickingGP] = useState(false);
+  const [photoDragIdx, setPhotoDragIdx] = useState(null);
+  const [photoOverIdx, setPhotoOverIdx] = useState(null);
   const fileRef = useRef(null);
 
   const useFB = syncCode && isFirebaseConfigured();
@@ -1069,24 +1082,114 @@ function DayEditor({ trip, day, dayIdx, syncCode, onUpdate, onBack }) {
         </div>
 
         {photos.length > 0 ? (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: 8 }}>
-            {photos.map((p, i) => (
-              <div key={i} style={{ position: 'relative', aspectRatio: '1', borderRadius: 3, overflow: 'hidden', border: `1px solid ${T.border}` }}>
-                <img src={p.url || p} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }}/>
-                <button
-                  onClick={() => removePhoto(i)}
-                  style={{
-                    position: 'absolute', top: 4, right: 4, padding: 4,
-                    background: 'rgba(0,0,0,.55)', border: 'none', color: '#fff',
-                    borderRadius: 3, cursor: 'pointer', display: 'inline-flex',
-                  }}
-                  title="삭제"
-                >
-                  <X size={12}/>
-                </button>
-              </div>
-            ))}
-          </div>
+          <>
+            <div style={{ ...css.label, marginBottom: 8 }}>
+              순서 변경: 썸네일을 드래그하거나 ◀▶ 화살표 클릭. 이 순서대로 블로그 글 작성에 반영됩니다.
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+              {photos.map((p, i) => {
+                const isDragged = photoDragIdx === i;
+                const isOver = photoOverIdx === i && photoDragIdx !== i;
+                return (
+                  <div
+                    key={i}
+                    draggable
+                    onDragStart={(e) => {
+                      setPhotoDragIdx(i);
+                      try { e.dataTransfer.setData('text/plain', String(i)); } catch {}
+                      e.dataTransfer.effectAllowed = 'move';
+                    }}
+                    onDragOver={(e) => { e.preventDefault(); setPhotoOverIdx(i); }}
+                    onDragLeave={() => setPhotoOverIdx(null)}
+                    onDragEnd={() => { setPhotoDragIdx(null); setPhotoOverIdx(null); }}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      if (photoDragIdx === null || photoDragIdx === i) {
+                        setPhotoDragIdx(null); setPhotoOverIdx(null); return;
+                      }
+                      const arr = [...photos];
+                      const [moved] = arr.splice(photoDragIdx, 1);
+                      arr.splice(i, 0, moved);
+                      onUpdate(d => ({ ...d, photos: arr }));
+                      setPhotoDragIdx(null); setPhotoOverIdx(null);
+                    }}
+                    style={{
+                      position: 'relative', width: 96, height: 96,
+                      borderRadius: 4, overflow: 'hidden',
+                      border: isOver ? `2px solid ${T.accent}` : `1px solid ${T.border}`,
+                      opacity: isDragged ? 0.4 : 1,
+                      cursor: isDragged ? 'grabbing' : 'grab',
+                      transition: 'border-color .15s, opacity .15s',
+                      background: '#F5F2EC',
+                    }}
+                  >
+                    <img src={p.url || p} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover', pointerEvents: 'none' }}/>
+                    <div style={{
+                      position: 'absolute', top: 3, left: 3,
+                      width: 18, height: 18, borderRadius: '50%',
+                      background: 'rgba(0,0,0,.7)', color: '#fff',
+                      fontFamily: T.S, fontSize: 10, fontWeight: 600,
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      pointerEvents: 'none',
+                    }}>{i + 1}</div>
+                    <button
+                      onClick={() => removePhoto(i)}
+                      style={{
+                        position: 'absolute', top: 3, right: 3, padding: 3,
+                        background: 'rgba(0,0,0,.6)', border: 'none', color: '#fff',
+                        borderRadius: 3, cursor: 'pointer', display: 'inline-flex',
+                      }}
+                      title="삭제"
+                    >
+                      <X size={10}/>
+                    </button>
+                    {/* 좌우 이동 화살표 */}
+                    <div style={{
+                      position: 'absolute', bottom: 0, left: 0, right: 0,
+                      display: 'flex', justifyContent: 'space-between', padding: 3,
+                    }}>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (i === 0) return;
+                          const arr = [...photos];
+                          [arr[i-1], arr[i]] = [arr[i], arr[i-1]];
+                          onUpdate(d => ({ ...d, photos: arr }));
+                        }}
+                        disabled={i === 0}
+                        style={{
+                          width: 22, height: 22, padding: 0,
+                          background: i === 0 ? 'rgba(0,0,0,.3)' : 'rgba(0,0,0,.7)',
+                          border: 'none', borderRadius: 3, color: '#fff',
+                          cursor: i === 0 ? 'not-allowed' : 'pointer',
+                          display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                          fontSize: 11,
+                        }}
+                      >◀</button>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (i === photos.length - 1) return;
+                          const arr = [...photos];
+                          [arr[i+1], arr[i]] = [arr[i], arr[i+1]];
+                          onUpdate(d => ({ ...d, photos: arr }));
+                        }}
+                        disabled={i === photos.length - 1}
+                        style={{
+                          width: 22, height: 22, padding: 0,
+                          background: i === photos.length - 1 ? 'rgba(0,0,0,.3)' : 'rgba(0,0,0,.7)',
+                          border: 'none', borderRadius: 3, color: '#fff',
+                          cursor: i === photos.length - 1 ? 'not-allowed' : 'pointer',
+                          display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                          fontSize: 11,
+                        }}
+                      >▶</button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </>
         ) : (
           <div
             onClick={() => fileRef.current?.click()}
@@ -1100,7 +1203,7 @@ function DayEditor({ trip, day, dayIdx, syncCode, onUpdate, onBack }) {
           >
             <ImageIcon size={28} style={{ display: 'block', margin: '0 auto 10px', opacity: .4 }}/>
             <strong style={{ color: T.ink, fontWeight: 500 }}>사진을 추가하세요</strong>
-            <div style={{ marginTop: 4 }}>클릭하거나 드롭</div>
+            <div style={{ marginTop: 4 }}>클릭하거나 드롭, 또는 Google Photos 버튼</div>
           </div>
         )}
       </section>
@@ -1232,6 +1335,67 @@ function DayEditor({ trip, day, dayIdx, syncCode, onUpdate, onBack }) {
             ))}
           </div>
         )}
+      </section>
+
+      {/* 자동 저장 안내 + 블로그로 넘어가기 */}
+      <section style={{
+        marginTop: 8, padding: 20,
+        background: T.accentSoft, border: `1px solid ${T.accentLight}`,
+        borderRadius: 6,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+          <Cloud size={13} color={T.success}/>
+          <strong style={{ fontFamily: T.S, fontSize: 12, color: T.accent }}>자동 저장 작동 중</strong>
+        </div>
+        <p style={{ fontFamily: T.S, fontSize: 12, color: T.sub, margin: '0 0 14px', lineHeight: 1.7 }}>
+          입력하신 일기·사진·동선·지출은 입력 즉시 저장됩니다. 별도 [저장] 버튼은 없으며, 다른 화면으로 이동하셔도 모두 보존됩니다.
+        </p>
+        <button
+          onClick={() => {
+            if (!photos.length && !day.diary && !wps.length) {
+              alert('블로그 글 작성을 위해서는 사진이나 일기가 필요합니다.\n먼저 입력해주세요.');
+              return;
+            }
+            // 블로그 작성 탭으로 데이터 넘기기
+            const seed = {
+              meta: {
+                title: `${trip.title} ${dayIdx + 1}일차`,
+                day: `${dayIdx + 1}일차 / ${day.date}`,
+                intro: day.diary || '',
+                hashtags: trip.country ? `#${trip.country}여행 #${trip.title.replace(/\s+/g, '')}` : '',
+              },
+              scenes: photos.map((p, i) => ({
+                id: uid(),
+                imageBase64: p.url || p,
+                caption: '',
+                memo: '',
+                place: wps[i]?.name || '',
+                menu: '',
+              })),
+              dayContext: {
+                date: day.date,
+                country: trip.country,
+                tripTitle: trip.title,
+                dayIdx,
+                diary: day.diary,
+                waypoints: wps,
+                expenses: exs,
+              },
+            };
+            onBlog(seed);
+          }}
+          disabled={!photos.length && !day.diary && !wps.length}
+          style={{
+            ...css.primaryBtn,
+            width: '100%', padding: 14, fontSize: 14,
+            justifyContent: 'center',
+          }}
+        >
+          <Sparkles size={15}/> 이 일자로 블로그 글 만들기
+        </button>
+        <p style={{ fontFamily: T.S, fontSize: 10, color: T.sub, margin: '8px 0 0', lineHeight: 1.6 }}>
+          위 사진 순서대로 블로그 작성 탭이 열리며, 일기·동선·지출 정보가 자동으로 글 작성에 반영됩니다.
+        </p>
       </section>
     </>
   );
@@ -1441,11 +1605,12 @@ function SyncPanel({ current, onClose, onApply }) {
 // ============================================================================
 // BLOG WRITER — 사진 업로드 + AI 캡션 + AI 글 생성 + SEO 분석
 // ============================================================================
-function BlogWriter({ apiKey, sample, customRules, draft, onDraftChange, savedBlogs, onSavedBlogsChange, onNeedKey }) {
+function BlogWriter({ apiKey, sample, customRules, draft, onDraftChange, savedBlogs, onSavedBlogsChange, seed, onSeedConsumed, onNeedKey }) {
   // draft에서 복원, 없으면 기본값
   const [meta, setMeta] = useState(draft?.meta || { title: '', day: '', intro: '', hashtags: '' });
   const [scenes, setScenes] = useState(draft?.scenes || []);
   const [result, setResult] = useState(draft?.result || '');
+  const [dayContext, setDayContext] = useState(draft?.dayContext || null);
   const [loading, setLoading] = useState(false);
   const [captionLoading, setCaptionLoading] = useState({});
   const [pickingGP, setPickingGP] = useState(false);
@@ -1463,18 +1628,30 @@ function BlogWriter({ apiKey, sample, customRules, draft, onDraftChange, savedBl
 
   const useGP = isGoogleConfigured();
 
+  // ★ DayEditor에서 넘어온 seed를 받아서 자동 초기화
+  useEffect(() => {
+    if (seed) {
+      setMeta(seed.meta);
+      setScenes(seed.scenes);
+      setDayContext(seed.dayContext || null);
+      setResult('');
+      setBView('edit');
+      onSeedConsumed?.();
+    }
+  }, [seed]);
+
   // ★ 자동 저장 — meta/scenes/result 변경 시 draft에 저장 (디바운스)
   useEffect(() => {
     const t = setTimeout(() => {
       const hasContent = meta.title || scenes.length > 0 || result;
       if (hasContent) {
-        onDraftChange({ meta, scenes, result, updatedAt: Date.now() });
+        onDraftChange({ meta, scenes, result, dayContext, updatedAt: Date.now() });
       } else {
         onDraftChange(null);
       }
     }, 500);
     return () => clearTimeout(t);
-  }, [meta, scenes, result]);
+  }, [meta, scenes, result, dayContext]);
 
   // 영구 저장
   const saveBlogPermanent = () => {
@@ -1511,6 +1688,7 @@ function BlogWriter({ apiKey, sample, customRules, draft, onDraftChange, savedBl
     setMeta({ title: '', day: '', intro: '', hashtags: '' });
     setScenes([]);
     setResult('');
+    setDayContext(null);
     setSeoData(null);
     setBView('edit');
     onDraftChange(null);
@@ -1623,6 +1801,28 @@ function BlogWriter({ apiKey, sample, customRules, draft, onDraftChange, savedBl
       return lines.join('\n');
     }).join('\n\n');
 
+    // 일자 컨텍스트 (DayEditor에서 넘어온 경우)
+    let dayContextText = '';
+    if (dayContext) {
+      const parts = [];
+      if (dayContext.diary) parts.push(`[그날의 일기]\n${dayContext.diary}`);
+      if (dayContext.waypoints?.length) {
+        const wpsText = dayContext.waypoints
+          .filter(w => w.name)
+          .map((w, i) => `${i+1}. ${w.name}${w.time ? ` (${w.time})` : ''}${w.transport ? ` · ${w.transport}` : ''}${w.duration ? ` · ${w.duration}` : ''}`)
+          .join('\n');
+        if (wpsText) parts.push(`[그날의 동선]\n${wpsText}`);
+      }
+      if (dayContext.expenses?.length) {
+        const expText = dayContext.expenses
+          .filter(e => e.amount)
+          .map(e => `- ${e.category}: ${e.amount} ${e.currency}${e.memo ? ` (${e.memo})` : ''}`)
+          .join('\n');
+        if (expText) parts.push(`[그날의 지출 — 참고용, 모두 글에 쓸 필요는 없음]\n${expText}`);
+      }
+      dayContextText = parts.length ? `\n\n${parts.join('\n\n')}\n` : '';
+    }
+
     const prompt = `당신은 한국 의사 출신 여행 블로거의 글쓰기 어시스턴트입니다. 아래 [샘플 글]의 문체를 정확히 모방하여 한 편의 완결된 블로그 글을 작성해주세요.
 
 [작성자 문체 핵심 특징]
@@ -1639,7 +1839,7 @@ ${sample}
 - 일차/일자: ${meta.day || '(미지정)'}
 - 도입부 분위기: ${meta.intro || '(자유롭게)'}
 - 해시태그: ${meta.hashtags || '(자동 생성)'}
-
+${dayContextText}
 [장면 데이터 — 시간순]
 ${scenesText}
 
@@ -1905,6 +2105,21 @@ ${result.slice(0, 3500)}${result.length > 3500 ? '\n...(생략)' : ''}
       }}>
         <Cloud size={11}/> <strong>자동 저장 작동 중</strong> · 입력하시는 모든 내용이 자동으로 보존됩니다. 탭 이동·새로고침해도 사라지지 않습니다.
       </div>
+
+      {/* DayEditor에서 넘어왔을 때 — 일자 정보 알림 */}
+      {dayContext && (
+        <div style={{
+          background: '#FEF3C7', border: '1px solid #FCD34D', borderRadius: 4,
+          padding: '10px 14px', marginBottom: 14, fontFamily: T.S, fontSize: 12,
+          color: '#92400E', lineHeight: 1.7,
+        }}>
+          📍 <strong>{dayContext.tripTitle} {dayContext.dayIdx + 1}일차</strong> 데이터로 시작합니다 ·{' '}
+          {dayContext.waypoints?.filter(w => w.name).length > 0 && `장소 ${dayContext.waypoints.filter(w => w.name).length}곳 `}
+          {dayContext.expenses?.filter(e => e.amount).length > 0 && `· 지출 ${dayContext.expenses.filter(e => e.amount).length}건 `}
+          {dayContext.diary && `· 일기 ${dayContext.diary.length}자 `}
+          모두 글 작성에 자동 반영됩니다.
+        </div>
+      )}
 
       {/* 저장된 글 목록 패널 */}
       {showSavedList && (

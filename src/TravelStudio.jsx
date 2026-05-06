@@ -1495,7 +1495,7 @@ function BlogWriter({ apiKey, sample, onNeedKey }) {
     try {
       const base64 = scene.imageBase64.split(',')[1];
       const mime = scene.imageBase64.match(/data:([^;]+);/)?.[1] || 'image/jpeg';
-      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1569,7 +1569,7 @@ ${scenesText}
 블로그 글 본문만 출력해주세요.`;
 
     try {
-      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1582,7 +1582,9 @@ ${scenesText}
       const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '생성 실패';
       setResult(text);
     } catch (err) {
-      setResult('오류: ' + err.message);
+      // 에러 발생 시 입력했던 내용은 유지하고 편집 화면으로 복귀
+      alert('글 생성 실패: ' + err.message + '\n\n입력하신 사진과 내용은 그대로 유지됩니다.');
+      setBView('edit');
     }
     setLoading(false);
   };
@@ -1628,7 +1630,7 @@ ${result.slice(0, 3500)}${result.length > 3500 ? '\n...(생략)' : ''}
 }`;
 
     try {
-      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

@@ -77,6 +77,13 @@ const STYLE_NOTES = `- 평어체 종결 (~했다, ~좋았다, ~인듯, ~같다)
 - "결단을 내려 ~ 주문하는데 성공" 식의 미세한 유머
 - 의료인 특유의 정돈된, 분석적이지만 따뜻한 톤`;
 
+// 사용자가 직접 추가/편집 가능한 개인 규칙 (AI 훈련 대체)
+const DEFAULT_RULES = `한국어로 자연스러운 일반 명사에는 영어를 병기하지 마세요. 예: '아이스 아메리카노' (X) '아이스 아메리카노 (iced americano)' — 한글로 충분합니다.
+영어 병기는 식당명·고유 메뉴명·브랜드명에만 사용하세요. 예: fran's, Eggs Benedict, Park Hyatt
+이모지를 본문에 사용하지 마세요. 사진 자리 표시인 [📷 N]만 예외입니다.
+의문문이나 감탄문을 남발하지 말고 평서문 위주로 작성하세요.
+감정 과장 표현(정말 너무 좋았다, 환상적이었다 등)은 절제하고 사실적인 묘사를 우선하세요.`;
+
 // ============================================================================
 // 유틸 함수
 // ============================================================================
@@ -304,6 +311,10 @@ export default function TravelStudio() {
   const [showSync, setShowSync] = useState(false);
   const [cloudStatus, setCloudStatus] = useState('idle');
   const [skipSave, setSkipSave] = useState(false);
+  // ── 추가 상태 — 블로그 작업 영속화 + 개인 규칙 ──
+  const [customRules, setCustomRules] = useState(init.customRules || DEFAULT_RULES);
+  const [draftBlog, setDraftBlog] = useState(init.draftBlog || null);
+  const [savedBlogs, setSavedBlogs] = useState(init.savedBlogs || []);
 
   // ── 파생 상태 ──
   const currentTrip = useMemo(
@@ -323,8 +334,8 @@ export default function TravelStudio() {
   // ── localStorage 자동 저장 ──
   useEffect(() => {
     if (skipSave) return;
-    saveLS({ trips, sample, apiKey, syncCode });
-  }, [trips, sample, apiKey, syncCode, skipSave]);
+    saveLS({ trips, sample, apiKey, syncCode, customRules, draftBlog, savedBlogs });
+  }, [trips, sample, apiKey, syncCode, customRules, draftBlog, savedBlogs, skipSave]);
 
   // ── Firebase 동기화 ──
   useEffect(() => {
@@ -501,10 +512,22 @@ export default function TravelStudio() {
 
         {/* 다른 탭들 */}
         {view.tab === 'blog' && (
-          <BlogWriter apiKey={apiKey} sample={sample} onNeedKey={() => setView(v => ({ ...v, tab: 'settings' }))} />
+          <BlogWriter
+            apiKey={apiKey}
+            sample={sample}
+            customRules={customRules}
+            draft={draftBlog}
+            onDraftChange={setDraftBlog}
+            savedBlogs={savedBlogs}
+            onSavedBlogsChange={setSavedBlogs}
+            onNeedKey={() => setView(v => ({ ...v, tab: 'settings' }))}
+          />
         )}
         {view.tab === 'samples' && (
-          <StyleSamples sample={sample} onChange={setSample} />
+          <StyleSamples
+            sample={sample} onChange={setSample}
+            customRules={customRules} onRulesChange={setCustomRules}
+          />
         )}
         {view.tab === 'settings' && (
           <SettingsTab
@@ -1418,22 +1441,80 @@ function SyncPanel({ current, onClose, onApply }) {
 // ============================================================================
 // BLOG WRITER — 사진 업로드 + AI 캡션 + AI 글 생성 + SEO 분석
 // ============================================================================
-function BlogWriter({ apiKey, sample, onNeedKey }) {
-  const [meta, setMeta] = useState({ title: '', day: '', intro: '', hashtags: '' });
-  const [scenes, setScenes] = useState([]);
-  const [result, setResult] = useState('');
+function BlogWriter({ apiKey, sample, customRules, draft, onDraftChange, savedBlogs, onSavedBlogsChange, onNeedKey }) {
+  // draft에서 복원, 없으면 기본값
+  const [meta, setMeta] = useState(draft?.meta || { title: '', day: '', intro: '', hashtags: '' });
+  const [scenes, setScenes] = useState(draft?.scenes || []);
+  const [result, setResult] = useState(draft?.result || '');
   const [loading, setLoading] = useState(false);
   const [captionLoading, setCaptionLoading] = useState({});
   const [pickingGP, setPickingGP] = useState(false);
   const [draggedIdx, setDraggedIdx] = useState(null);
   const [dragOverIdx, setDragOverIdx] = useState(null);
   const [copied, setCopied] = useState(false);
-  const [view, setBView] = useState('edit');  // edit | preview | seo
+  const [view, setBView] = useState(draft?.result ? 'preview' : 'edit');
   const [seoData, setSeoData] = useState(null);
   const [seoLoading, setSeoLoading] = useState(false);
+  const [showSavedList, setShowSavedList] = useState(false);
+  const [editingResult, setEditingResult] = useState(false);
+  const [resultDraft, setResultDraft] = useState('');
+  const [refining, setRefining] = useState(false);
   const fileRef = useRef(null);
 
   const useGP = isGoogleConfigured();
+
+  // ★ 자동 저장 — meta/scenes/result 변경 시 draft에 저장 (디바운스)
+  useEffect(() => {
+    const t = setTimeout(() => {
+      const hasContent = meta.title || scenes.length > 0 || result;
+      if (hasContent) {
+        onDraftChange({ meta, scenes, result, updatedAt: Date.now() });
+      } else {
+        onDraftChange(null);
+      }
+    }, 500);
+    return () => clearTimeout(t);
+  }, [meta, scenes, result]);
+
+  // 영구 저장
+  const saveBlogPermanent = () => {
+    if (!result) { alert('저장할 글이 없습니다.'); return; }
+    const title = meta.title || '제목 없음';
+    const blog = {
+      id: uid(),
+      title,
+      meta: { ...meta },
+      scenes: scenes.map(s => ({ ...s })),
+      result,
+      savedAt: Date.now(),
+    };
+    onSavedBlogsChange([blog, ...savedBlogs]);
+    alert(`"${title}" 저장 완료. 저장된 글 목록에서 다시 불러올 수 있습니다.`);
+  };
+
+  const loadSavedBlog = (blog) => {
+    if (result && !confirm('현재 작업 중인 내용이 있습니다. 불러오면 덮어씁니다. 계속할까요?')) return;
+    setMeta(blog.meta);
+    setScenes(blog.scenes);
+    setResult(blog.result);
+    setBView('preview');
+    setShowSavedList(false);
+  };
+
+  const deleteSavedBlog = (id) => {
+    if (!confirm('이 저장된 글을 삭제하시겠습니까?')) return;
+    onSavedBlogsChange(savedBlogs.filter(b => b.id !== id));
+  };
+
+  const startNewDraft = () => {
+    if ((result || scenes.length > 0) && !confirm('현재 작업이 사라집니다. 새로 시작할까요?')) return;
+    setMeta({ title: '', day: '', intro: '', hashtags: '' });
+    setScenes([]);
+    setResult('');
+    setSeoData(null);
+    setBView('edit');
+    onDraftChange(null);
+  };
 
   const handleUpload = async (e) => {
     const files = Array.from(e.target.files || []);
@@ -1547,6 +1628,9 @@ function BlogWriter({ apiKey, sample, onNeedKey }) {
 [작성자 문체 핵심 특징]
 ${STYLE_NOTES}
 
+[작성자 개인 규칙 — 반드시 준수]
+${customRules || '(없음)'}
+
 [샘플 글]
 ${sample}
 
@@ -1587,6 +1671,42 @@ ${scenesText}
       setBView('edit');
     }
     setLoading(false);
+  };
+
+  // 생성된 글에 대해 부분 수정 요청
+  const refineBlog = async (instruction) => {
+    if (!apiKey) { alert('API 키가 필요합니다.'); onNeedKey(); return; }
+    if (!result) return;
+    if (!instruction?.trim()) return;
+    setRefining(true);
+    const prompt = `다음은 한국 의사 출신 여행 블로거가 작성한 블로그 글입니다. 사용자가 아래 [수정 요청]을 했습니다. 요청에 맞춰 글 전체를 자연스럽게 다시 다듬어주세요. 문체와 톤은 그대로 유지하고, [📷 N] 사진 자리 표시도 그대로 유지하세요. 수정된 글 본문만 출력하세요.
+
+[작성자 개인 규칙]
+${customRules || '(없음)'}
+
+[원본 글]
+${result}
+
+[수정 요청]
+${instruction}`;
+
+    try {
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.6, maxOutputTokens: 3500 },
+        }),
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error.message);
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (text) setResult(text);
+    } catch (err) {
+      alert('수정 실패: ' + err.message);
+    }
+    setRefining(false);
   };
 
   const analyzeSeo = async () => {
@@ -1761,11 +1881,57 @@ ${result.slice(0, 3500)}${result.length > 3500 ? '\n...(생략)' : ''}
 
   return (
     <>
-      <div style={{ marginBottom: 28 }}>
-        <div style={css.eyebrow}>블로그 작성</div>
-        <h1 style={css.hero}>여행을 <span style={{ fontStyle: 'italic', color: T.accent }}>글로</span></h1>
-        <p style={css.lead}>사진을 올리고 느낌을 메모하면, 평소 문체로 완결된 블로그 글을 써드립니다.</p>
+      <div style={{ marginBottom: 20, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, flexWrap: 'wrap' }}>
+        <div>
+          <div style={css.eyebrow}>블로그 작성</div>
+          <h1 style={css.hero}>여행을 <span style={{ fontStyle: 'italic', color: T.accent }}>글로</span></h1>
+          <p style={css.lead}>사진을 올리고 느낌을 메모하면, 평소 문체로 완결된 블로그 글을 써드립니다.</p>
+        </div>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+          <button onClick={() => setShowSavedList(!showSavedList)} style={{ ...css.secondaryBtn, fontSize: 11, padding: '6px 11px' }}>
+            <FileText size={11}/> 저장된 글 {savedBlogs.length > 0 && `(${savedBlogs.length})`}
+          </button>
+          <button onClick={startNewDraft} style={{ ...css.secondaryBtn, fontSize: 11, padding: '6px 11px' }}>
+            <Plus size={11}/> 새로 시작
+          </button>
+        </div>
       </div>
+
+      {/* 자동 저장 안내 */}
+      <div style={{
+        background: T.accentSoft, border: `1px solid ${T.accentLight}`, borderRadius: 4,
+        padding: '8px 12px', marginBottom: 14, fontFamily: T.S, fontSize: 11,
+        color: T.accent, display: 'flex', alignItems: 'center', gap: 6,
+      }}>
+        <Cloud size={11}/> <strong>자동 저장 작동 중</strong> · 입력하시는 모든 내용이 자동으로 보존됩니다. 탭 이동·새로고침해도 사라지지 않습니다.
+      </div>
+
+      {/* 저장된 글 목록 패널 */}
+      {showSavedList && (
+        <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 4, padding: 16, marginBottom: 14 }}>
+          <div style={{ ...css.eyebrow, marginBottom: 10 }}>저장된 글 ({savedBlogs.length})</div>
+          {savedBlogs.length === 0 ? (
+            <p style={{ fontFamily: T.S, fontSize: 12, color: T.sub, margin: 0 }}>아직 저장된 글이 없습니다. 글 생성 후 미리보기에서 [저장] 버튼을 누르세요.</p>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {savedBlogs.map(b => (
+                <div key={b.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px', background: T.soft, border: `1px solid ${T.border}`, borderRadius: 3 }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontFamily: T.S, fontSize: 13, fontWeight: 500, color: T.ink }}>{b.title}</div>
+                    <div style={{ fontFamily: T.S, fontSize: 10, color: T.sub, marginTop: 2 }}>
+                      {new Date(b.savedAt).toLocaleString('ko-KR')} · {b.scenes?.length || 0}장
+                    </div>
+                  </div>
+                  <button onClick={() => loadSavedBlog(b)} style={{ ...css.secondaryBtn, fontSize: 11, padding: '5px 10px' }}>불러오기</button>
+                  <button onClick={() => deleteSavedBlog(b.id)} style={{ background: 'none', border: 'none', color: T.sub, cursor: 'pointer', padding: 4, display: 'inline-flex' }}>
+                    <Trash2 size={12}/>
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       <div style={{ display: 'flex', gap: 6, marginBottom: 20, borderBottom: `1px solid ${T.border}` }}>
         {[
@@ -1847,16 +2013,31 @@ ${result.slice(0, 3500)}${result.length > 3500 ? '\n...(생략)' : ''}
             )}
           </div>
 
-          {scenes.length > 0 && <div style={{ ...css.label, marginBottom: 12 }}>{scenes.length}개 장면 · 핸들 드래그로 순서 변경</div>}
+          {scenes.length > 0 && (
+            <>
+              <PhotoOrderTray
+                scenes={scenes}
+                onReorder={setScenes}
+                draggedIdx={draggedIdx}
+                setDraggedIdx={setDraggedIdx}
+                dragOverIdx={dragOverIdx}
+                setDragOverIdx={setDragOverIdx}
+              />
+              <div style={{ ...css.label, marginTop: 14, marginBottom: 12 }}>
+                {scenes.length}개 장면 · 위 썸네일을 드래그·화살표로 순서 변경 · 클릭 시 해당 카드로 이동
+              </div>
+            </>
+          )}
 
           {scenes.map((s, idx) => (
             <div
               key={s.id}
+              id={`scene-card-${s.id}`}
               style={{
                 background: T.soft,
                 border: `1px solid ${dragOverIdx === idx && draggedIdx !== idx ? T.accent : T.border}`,
                 borderLeft: `3px solid ${T.accent}`, borderRadius: 3, padding: 18, marginBottom: 12,
-                opacity: draggedIdx === idx ? 0.4 : 1, transition: 'border-color .15s, opacity .15s',
+                opacity: draggedIdx === idx ? 0.4 : 1, transition: 'border-color .15s, opacity .15s, box-shadow .3s',
               }}
               onDragOver={e => onDragOver(e, idx)}
               onDragLeave={() => setDragOverIdx(null)}
@@ -1927,21 +2108,51 @@ ${result.slice(0, 3500)}${result.length > 3500 ? '\n...(생략)' : ''}
           )}
           {!loading && result && (
             <>
-              <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 4, padding: '32px 28px', lineHeight: 1.95, fontSize: 15, fontFamily: T.B, color: T.ink }}>
-                {renderPreview(result)}
-              </div>
-              <div style={{ display: 'flex', gap: 8, marginTop: 14, flexWrap: 'wrap' }}>
-                <button style={css.secondaryBtn} onClick={() => { navigator.clipboard.writeText(result); setCopied(true); setTimeout(() => setCopied(false), 2000); }}>
-                  {copied ? <><Check size={12}/> 복사됨</> : <><Copy size={12}/> 본문 복사</>}
-                </button>
-                <button style={css.secondaryBtn} onClick={() => setBView('edit')}><Edit3 size={12}/> 편집으로</button>
-                <button onClick={analyzeSeo} style={{ ...css.primaryBtn, marginLeft: 'auto' }}>
-                  <BarChart3 size={14}/> SEO 분석
-                </button>
-              </div>
-              <p style={{ fontFamily: T.S, fontSize: 11, color: T.sub, marginTop: 10, lineHeight: 1.7 }}>
-                * 네이버 블로그에 붙여넣을 때 [📷 N] 자리에 사진을 끌어다 놓으세요.
-              </p>
+              {editingResult ? (
+                <>
+                  <textarea
+                    value={resultDraft}
+                    onChange={e => setResultDraft(e.target.value)}
+                    rows={20}
+                    style={{ ...css.textarea, fontSize: 14, lineHeight: 1.8, padding: '20px 22px' }}
+                  />
+                  <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+                    <button style={css.secondaryBtn} onClick={() => setEditingResult(false)}>취소</button>
+                    <button onClick={() => { setResult(resultDraft); setEditingResult(false); }} style={{ ...css.primaryBtn, marginLeft: 'auto' }}>
+                      <Check size={13}/> 저장
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 4, padding: '32px 28px', lineHeight: 1.95, fontSize: 15, fontFamily: T.B, color: T.ink }}>
+                    {renderPreview(result)}
+                  </div>
+
+                  {/* AI 수정 요청 */}
+                  <RefineBox onRefine={refineBlog} refining={refining}/>
+
+                  <div style={{ display: 'flex', gap: 8, marginTop: 14, flexWrap: 'wrap' }}>
+                    <button style={css.secondaryBtn} onClick={() => { navigator.clipboard.writeText(result); setCopied(true); setTimeout(() => setCopied(false), 2000); }}>
+                      {copied ? <><Check size={12}/> 복사됨</> : <><Copy size={12}/> 본문 복사</>}
+                    </button>
+                    <button style={css.secondaryBtn} onClick={() => { setResultDraft(result); setEditingResult(true); }}>
+                      <Edit3 size={12}/> 직접 수정
+                    </button>
+                    <button style={css.secondaryBtn} onClick={saveBlogPermanent}>
+                      <FileText size={12}/> 영구 저장
+                    </button>
+                    <button style={css.secondaryBtn} onClick={() => setBView('edit')}>← 편집으로</button>
+                    <button onClick={analyzeSeo} style={{ ...css.primaryBtn, marginLeft: 'auto' }}>
+                      <BarChart3 size={14}/> SEO 분석
+                    </button>
+                  </div>
+                  <p style={{ fontFamily: T.S, fontSize: 11, color: T.sub, marginTop: 10, lineHeight: 1.7 }}>
+                    * 네이버 블로그에 붙여넣을 때 [📷 N] 자리에 사진을 끌어다 놓으세요.<br/>
+                    * 마음에 안 드는 부분이 있으면 위의 [AI 수정 요청] 또는 [직접 수정] 사용
+                  </p>
+                </>
+              )}
             </>
           )}
           {!loading && !result && (
@@ -2088,17 +2299,46 @@ function SEOReport({ data, onBack, onRetry }) {
 // ============================================================================
 // STYLE SAMPLES
 // ============================================================================
-function StyleSamples({ sample, onChange }) {
+function StyleSamples({ sample, onChange, customRules, onRulesChange }) {
   return (
     <>
       <div style={{ marginBottom: 28 }}>
-        <div style={css.eyebrow}>문체 샘플</div>
+        <div style={css.eyebrow}>문체 샘플 · 개인 규칙</div>
         <h1 style={css.hero}>나의 <span style={{ fontStyle: 'italic', color: T.accent }}>글쓰기 톤</span></h1>
-        <p style={css.lead}>AI가 글을 생성할 때 이 샘플을 기반으로 문체를 학습합니다.</p>
+        <p style={css.lead}>AI가 글을 생성할 때 아래 샘플과 규칙을 기반으로 문체를 학습합니다.</p>
       </div>
+
+      {/* 개인 규칙 — Custom Rules */}
+      <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 4, padding: 24, marginBottom: 16 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 10 }}>
+          <h2 style={css.sectionH}>내 규칙 <span style={{ fontFamily: T.S, fontStyle: 'normal', fontSize: 11, color: T.sub, fontWeight: 400, marginLeft: 6 }}>Custom Rules</span></h2>
+          <span style={{ fontFamily: T.S, fontSize: 11, color: T.sub }}>
+            {(customRules || '').length.toLocaleString()}자
+          </span>
+        </div>
+        <p style={{ fontFamily: T.S, fontSize: 12, color: T.sub, lineHeight: 1.7, margin: '0 0 12px' }}>
+          AI가 글 쓸 때 마음에 안 들었던 패턴을 발견할 때마다 여기에 한 줄씩 추가하세요. 매번 글 생성 시 자동으로 반영됩니다. <strong style={{ color: T.accent }}>개인화된 AI 학습 효과</strong>를 냅니다.
+        </p>
+        <textarea
+          rows={10}
+          value={customRules || ''}
+          onChange={e => onRulesChange(e.target.value)}
+          placeholder="예: 한국어 일반 명사에 영어 병기 금지 (아이스 아메리카노 → 영어 추가 X)"
+          style={{ ...css.textarea, fontSize: 13, lineHeight: 1.7 }}
+        />
+        <div style={{ marginTop: 10, padding: '10px 12px', background: T.accentSoft, border: `1px solid ${T.accentLight}`, borderRadius: 3, fontFamily: T.S, fontSize: 11, color: T.accent, lineHeight: 1.6 }}>
+          💡 <strong>팁</strong>: 글을 쓰다가 마음에 안 드는 표현이 나오면 즉시 여기 추가. 시간이 지날수록 본인 문체에 더 가까워집니다.
+        </div>
+      </div>
+
+      {/* 문체 샘플 */}
       <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 4, padding: 24 }}>
+        <h2 style={css.sectionH}>문체 샘플</h2>
+        <p style={{ fontFamily: T.S, fontSize: 12, color: T.sub, lineHeight: 1.7, margin: '6px 0 12px' }}>
+          평소 작성하시던 블로그 글을 붙여넣으세요. AI가 이 글의 톤·종결·어휘 선택을 모방합니다.
+        </p>
         <label style={css.label}>샘플글 (2,000–5,000자 권장)</label>
-        <textarea rows={20} style={{ ...css.textarea, fontSize: 13 }} value={sample} onChange={e => onChange(e.target.value)}/>
+        <textarea rows={16} style={{ ...css.textarea, fontSize: 13 }} value={sample} onChange={e => onChange(e.target.value)}/>
         <p style={{ fontFamily: T.S, fontSize: 11, color: T.sub, marginTop: 8, lineHeight: 1.6 }}>
           현재 {sample.length.toLocaleString()}자
         </p>
@@ -2221,5 +2461,221 @@ VITE_FIREBASE_APP_ID=1:xxx:web:xxx`}
         </div>
       </div>
     </>
+  );
+}
+
+// ============================================================================
+// PHOTO ORDER TRAY — 사진 순서 변경 (스티키 가로 스크롤)
+// ============================================================================
+function PhotoOrderTray({ scenes, onReorder, draggedIdx, setDraggedIdx, dragOverIdx, setDragOverIdx }) {
+  const moveLeft = (idx) => {
+    if (idx === 0) return;
+    const next = [...scenes];
+    [next[idx-1], next[idx]] = [next[idx], next[idx-1]];
+    onReorder(next);
+  };
+  const moveRight = (idx) => {
+    if (idx === scenes.length - 1) return;
+    const next = [...scenes];
+    [next[idx+1], next[idx]] = [next[idx], next[idx+1]];
+    onReorder(next);
+  };
+
+  const onDragStart = (e, i) => {
+    setDraggedIdx(i);
+    e.dataTransfer.effectAllowed = 'move';
+    try { e.dataTransfer.setData('text/plain', String(i)); } catch {}
+  };
+  const onDragOverItem = (e, i) => { e.preventDefault(); setDragOverIdx(i); };
+  const onDropItem = (e, i) => {
+    e.preventDefault();
+    if (draggedIdx === null || draggedIdx === i) {
+      setDraggedIdx(null); setDragOverIdx(null); return;
+    }
+    const a = [...scenes];
+    const [moved] = a.splice(draggedIdx, 1);
+    a.splice(i, 0, moved);
+    onReorder(a);
+    setDraggedIdx(null); setDragOverIdx(null);
+  };
+
+  const scrollToCard = (sceneId) => {
+    const el = document.getElementById(`scene-card-${sceneId}`);
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      el.style.boxShadow = `0 0 0 3px ${T.accent}`;
+      setTimeout(() => { el.style.boxShadow = ''; }, 1200);
+    }
+  };
+
+  return (
+    <div style={{
+      position: 'sticky', top: 49, zIndex: 20,
+      background: T.bg, paddingTop: 8, paddingBottom: 4,
+    }}>
+      <div style={{
+        background: T.card, border: `1px solid ${T.border}`, borderRadius: 6,
+        padding: '10px 12px', boxShadow: '0 2px 8px rgba(28,25,23,.04)',
+      }}>
+        <div style={{
+          fontFamily: T.S, fontSize: 10, letterSpacing: '0.14em',
+          textTransform: 'uppercase', color: T.sub, marginBottom: 8, fontWeight: 500,
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        }}>
+          <span>사진 순서 ({scenes.length})</span>
+          <span style={{ textTransform: 'none', letterSpacing: 0, fontSize: 10, fontWeight: 400 }}>
+            드래그 또는 ◀▶ 화살표 · 클릭 시 카드로 이동
+          </span>
+        </div>
+        <div style={{
+          display: 'flex', gap: 8, overflowX: 'auto', paddingBottom: 4,
+        }}>
+          {scenes.map((s, idx) => (
+            <div
+              key={s.id}
+              draggable
+              onDragStart={e => onDragStart(e, idx)}
+              onDragOver={e => onDragOverItem(e, idx)}
+              onDrop={e => onDropItem(e, idx)}
+              onDragEnd={() => { setDraggedIdx(null); setDragOverIdx(null); }}
+              onClick={() => scrollToCard(s.id)}
+              style={{
+                position: 'relative', flexShrink: 0,
+                width: 72, height: 72, borderRadius: 4,
+                overflow: 'hidden',
+                cursor: draggedIdx === idx ? 'grabbing' : 'pointer',
+                opacity: draggedIdx === idx ? 0.4 : 1,
+                border: dragOverIdx === idx && draggedIdx !== idx
+                  ? `2px solid ${T.accent}`
+                  : `1px solid ${T.border}`,
+                transition: 'border-color .15s, opacity .15s',
+                background: '#F5F2EC',
+              }}
+            >
+              <img src={s.imageBase64} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover', pointerEvents: 'none' }}/>
+              <div style={{
+                position: 'absolute', top: 2, left: 2,
+                width: 18, height: 18, borderRadius: '50%',
+                background: 'rgba(0,0,0,.7)', color: '#fff',
+                fontFamily: T.S, fontSize: 10, fontWeight: 600,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                pointerEvents: 'none',
+              }}>{idx + 1}</div>
+              {/* 좌/우 이동 버튼 */}
+              <div style={{
+                position: 'absolute', bottom: 0, left: 0, right: 0,
+                display: 'flex', justifyContent: 'space-between', padding: 2,
+              }}>
+                <button
+                  onClick={(e) => { e.stopPropagation(); moveLeft(idx); }}
+                  disabled={idx === 0}
+                  style={{
+                    width: 18, height: 18, padding: 0,
+                    background: idx === 0 ? 'rgba(0,0,0,.3)' : 'rgba(0,0,0,.7)',
+                    border: 'none', borderRadius: 3, color: '#fff',
+                    cursor: idx === 0 ? 'not-allowed' : 'pointer',
+                    display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                  }}
+                  title="앞으로"
+                >◀</button>
+                <button
+                  onClick={(e) => { e.stopPropagation(); moveRight(idx); }}
+                  disabled={idx === scenes.length - 1}
+                  style={{
+                    width: 18, height: 18, padding: 0,
+                    background: idx === scenes.length - 1 ? 'rgba(0,0,0,.3)' : 'rgba(0,0,0,.7)',
+                    border: 'none', borderRadius: 3, color: '#fff',
+                    cursor: idx === scenes.length - 1 ? 'not-allowed' : 'pointer',
+                    display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                  }}
+                  title="뒤로"
+                >▶</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// REFINE BOX — AI 수정 요청
+// ============================================================================
+function RefineBox({ onRefine, refining }) {
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState('');
+
+  const presets = [
+    '한국어 일반 명사에 영어 병기를 모두 제거해주세요',
+    '문장을 좀 더 짧고 간결하게 다듬어주세요',
+    '감정 표현을 줄이고 사실 묘사 중심으로 바꿔주세요',
+    '단락을 좀 더 잘게 나눠주세요',
+  ];
+
+  const submit = () => {
+    if (!text.trim()) return;
+    onRefine(text.trim());
+    setText('');
+    setOpen(false);
+  };
+
+  if (!open) {
+    return (
+      <button
+        onClick={() => setOpen(true)}
+        style={{
+          width: '100%', padding: '12px 16px', marginTop: 14,
+          background: T.accentSoft, border: `1px dashed ${T.accentLight}`,
+          borderRadius: 4, fontFamily: T.S, fontSize: 12, color: T.accent,
+          cursor: 'pointer', display: 'flex', alignItems: 'center',
+          justifyContent: 'center', gap: 6,
+        }}
+      >
+        <Sparkles size={13}/> AI에게 수정 요청 (예: "영어 병기 제거", "감정 표현 줄이기")
+      </button>
+    );
+  }
+
+  return (
+    <div style={{
+      marginTop: 14, padding: 14,
+      background: T.accentSoft, border: `1px solid ${T.accentLight}`,
+      borderRadius: 4,
+    }}>
+      <div style={{ ...css.label, color: T.accent, marginBottom: 8 }}>AI 수정 요청</div>
+      <textarea
+        value={text}
+        onChange={e => setText(e.target.value)}
+        rows={2}
+        placeholder="예: 한국어 명사에 영어 병기 제거 / 마지막 문단 좀 더 따뜻하게 / 두번째 단락 짧게"
+        style={{ ...css.textarea, fontSize: 13 }}
+        autoFocus
+      />
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 8 }}>
+        {presets.map((p, i) => (
+          <button
+            key={i}
+            onClick={() => setText(p)}
+            style={{
+              padding: '4px 10px', background: T.card, border: `1px solid ${T.border}`,
+              borderRadius: 99, fontFamily: T.S, fontSize: 11, color: T.sub, cursor: 'pointer',
+            }}
+          >
+            {p}
+          </button>
+        ))}
+      </div>
+      <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+        <button onClick={() => { setOpen(false); setText(''); }} style={css.secondaryBtn} disabled={refining}>취소</button>
+        <button
+          onClick={submit}
+          disabled={refining || !text.trim()}
+          style={{ ...css.primaryBtn, marginLeft: 'auto' }}
+        >
+          {refining ? <><Loader2 size={13} className="spin"/> 수정 중…</> : <><Sparkles size={13}/> 다시쓰기</>}
+        </button>
+      </div>
+    </div>
   );
 }

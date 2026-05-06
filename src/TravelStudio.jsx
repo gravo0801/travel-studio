@@ -1635,16 +1635,85 @@ ${result.slice(0, 3500)}${result.length > 3500 ? '\n...(생략)' : ''}
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{ parts: [{ text: aiPrompt }] }],
-          generationConfig: { temperature: 0.25, maxOutputTokens: 1000 },
+          generationConfig: {
+            temperature: 0.25,
+            maxOutputTokens: 1500,
+            // ★ Structured Output — JSON을 강제로 유효하게 만듦
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: 'object',
+              properties: {
+                keyword_score:        { type: 'integer' },
+                readability_score:    { type: 'integer' },
+                info_score:           { type: 'integer' },
+                keyword_feedback:     { type: 'string' },
+                readability_feedback: { type: 'string' },
+                info_feedback:        { type: 'string' },
+                improvements:         { type: 'array', items: { type: 'string' } },
+                suggested_keywords:   { type: 'array', items: { type: 'string' } },
+                overall_comment:      { type: 'string' },
+              },
+              required: ['keyword_score', 'readability_score', 'info_score', 'overall_comment'],
+            },
+          },
         }),
       });
       const data = await res.json();
       if (data.error) throw new Error(data.error.message);
       const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      let jsonText = raw.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-      const fb = jsonText.indexOf('{'), lb = jsonText.lastIndexOf('}');
-      if (fb >= 0 && lb > fb) jsonText = jsonText.slice(fb, lb + 1);
-      const json = JSON.parse(jsonText);
+
+      // 강력한 JSON 파싱 — 3단계 fallback
+      let json;
+      try {
+        // 1차: 그대로 파싱 (structured output이면 거의 성공)
+        json = JSON.parse(raw);
+      } catch (e1) {
+        try {
+          // 2차: markdown 펜스 제거 + 중괄호 추출
+          let cleaned = raw.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+          const fb = cleaned.indexOf('{'), lb = cleaned.lastIndexOf('}');
+          if (fb >= 0 && lb > fb) cleaned = cleaned.slice(fb, lb + 1);
+          json = JSON.parse(cleaned);
+        } catch (e2) {
+          try {
+            // 3차: 줄바꿈 이스케이프 + 제어문자 제거
+            let fixed = raw
+              .replace(/```json\s*/g, '')
+              .replace(/```\s*/g, '')
+              .trim();
+            const fb = fixed.indexOf('{'), lb = fixed.lastIndexOf('}');
+            if (fb >= 0 && lb > fb) fixed = fixed.slice(fb, lb + 1);
+            // 문자열 안의 줄바꿈을 \n으로 변환
+            fixed = fixed.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ');
+            json = JSON.parse(fixed);
+          } catch (e3) {
+            // 4차: 정규식으로 개별 필드 추출
+            const extract = (key, isNum = false) => {
+              const re = isNum
+                ? new RegExp(`"${key}"\\s*:\\s*(\\d+)`)
+                : new RegExp(`"${key}"\\s*:\\s*"([^"]+)"`);
+              return raw.match(re)?.[1];
+            };
+            const extractArr = (key) => {
+              const re = new RegExp(`"${key}"\\s*:\\s*\\[([^\\]]+)\\]`);
+              const m = raw.match(re);
+              if (!m) return [];
+              return [...m[1].matchAll(/"([^"]+)"/g)].map(x => x[1]);
+            };
+            json = {
+              keyword_score: parseInt(extract('keyword_score', true) || '0'),
+              readability_score: parseInt(extract('readability_score', true) || '0'),
+              info_score: parseInt(extract('info_score', true) || '0'),
+              keyword_feedback: extract('keyword_feedback') || '분석 데이터 부분 손실',
+              readability_feedback: extract('readability_feedback') || '분석 데이터 부분 손실',
+              info_feedback: extract('info_feedback') || '분석 데이터 부분 손실',
+              improvements: extractArr('improvements'),
+              suggested_keywords: extractArr('suggested_keywords'),
+              overall_comment: extract('overall_comment') || '분석 일부 누락. 다시 시도해보세요.',
+            };
+          }
+        }
+      }
 
       setSeoData({
         auto: { length: lengthScore, image: imageScore, hashtag: tagScore },

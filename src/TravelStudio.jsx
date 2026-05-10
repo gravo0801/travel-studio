@@ -9,7 +9,7 @@ import {
   Sparkles, Copy, BookOpen, Briefcase, Loader2, Check, Camera,
   Edit3, Upload, GripVertical, Eye, EyeOff, Settings, Trash2,
   AlertCircle, Image as ImageIcon, ArrowLeft, FileText, BarChart3,
-  ExternalLink,
+  ExternalLink, Send, Save, Globe, Link as LinkIcon, ClipboardCheck,
 } from 'lucide-react';
 
 // ============================================================================
@@ -422,6 +422,7 @@ export default function TravelStudio() {
             {[
               { id: 'library', icon: <BookOpen size={14}/>, label: '라이브러리' },
               { id: 'blog',    icon: <Edit3   size={14}/>, label: '블로그 작성' },
+              { id: 'review',  icon: <ClipboardCheck size={14}/>, label: '글 평가' },
               { id: 'samples', icon: <FileText size={14}/>, label: '문체 샘플' },
               { id: 'settings',icon: <Settings size={14}/>, label: '설정' },
             ].map(t => (
@@ -531,6 +532,12 @@ export default function TravelStudio() {
             onSavedBlogsChange={setSavedBlogs}
             seed={blogSeed}
             onSeedConsumed={() => setBlogSeed(null)}
+            onNeedKey={() => setView(v => ({ ...v, tab: 'settings' }))}
+          />
+        )}
+        {view.tab === 'review' && (
+          <Reviewer
+            apiKey={apiKey}
             onNeedKey={() => setView(v => ({ ...v, tab: 'settings' }))}
           />
         )}
@@ -1605,6 +1612,216 @@ function SyncPanel({ current, onClose, onApply }) {
 // ============================================================================
 // BLOG WRITER — 사진 업로드 + AI 캡션 + AI 글 생성 + SEO 분석
 // ============================================================================
+// ============================================================================
+// SEO 분석 — 재사용 가능한 순수 함수 (BlogWriter / Reviewer 공통)
+// ============================================================================
+// 결정론적 점검 항목:
+//  - 글 길이 / 이미지 / 해시태그 (기존)
+//  - 이미지 alt 누락 비율 (마크다운 ![alt](url) 또는 [📷 N] 캡션 유무)
+//  - 헤딩 구조 (#, ##)
+//  - 내부/외부 링크 균형
+//  - 한국어 가독성 휴리스틱(평균 문장 길이)
+// + Gemini 기반 키워드/가독성/정보충실도 코칭
+async function runSeoAnalysis(rawText, opts = {}) {
+  const {
+    apiKey,
+    title = '',
+    targetKeywords = '',
+    hashtagsHint = '',
+    siteHost = '',  // 내부 링크 판정용 호스트 (옵션)
+  } = opts;
+
+  if (!apiKey) throw new Error('API 키가 필요합니다.');
+  if (!rawText || !rawText.trim()) throw new Error('분석할 글이 비어 있습니다.');
+
+  // -------- 결정론적 측정 --------
+  const text = rawText;
+  const cleanText = text
+    .replace(/\[📷[^\]]*\]/g, '')
+    .replace(/!\[[^\]]*\]\([^)]+\)/g, '')
+    .trim();
+  const charCount = cleanText.replace(/\s/g, '').length;
+
+  // 이미지 카운트: [📷 N] (Travel Studio 형식) 또는 마크다운 이미지
+  const tsImgs = text.match(/\[📷\s*\d+\][^\n]*/g) || [];
+  const mdImgs = [...text.matchAll(/!\[([^\]]*)\]\(([^)]+)\)/g)];
+  const imageCount = tsImgs.length + mdImgs.length;
+
+  // alt 누락 비율 — [📷 N] 뒤 캡션 텍스트가 비었는지, 마크다운은 alt가 비었는지
+  const tsMissingAlt = tsImgs.filter(s => !/\[📷\s*\d+\]\s*\S/.test(s)).length;
+  const mdMissingAlt = mdImgs.filter(m => !m[1] || !m[1].trim()).length;
+  const altMissing = tsMissingAlt + mdMissingAlt;
+  const altRatio = imageCount === 0 ? 1 : 1 - altMissing / imageCount;
+
+  // 해시태그
+  const hashtagSrc = (text.match(/^#.+/m)?.[0] || '') + ' ' + (hashtagsHint || '');
+  const hashtagCount = (hashtagSrc.match(/#\S+/g) || []).length;
+
+  // 헤딩 — 마크다운 # / ## 또는 줄 시작 "■", "▶", "▷" 같은 한국 블로그 패턴도 가산
+  const h1 = (text.match(/^#\s+\S/gm) || []).length;
+  const h2 = (text.match(/^##\s+\S/gm) || []).length;
+  const koHead = (text.match(/^[■▶▷◆●]\s*\S/gm) || []).length;
+  const headingTotal = h1 + h2 + koHead;
+
+  // 링크
+  const links = [...text.matchAll(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g)];
+  const isInternal = (url) => {
+    if (!siteHost) return false;
+    try { return new URL(url).host.includes(siteHost); } catch { return false; }
+  };
+  const internalLinks = links.filter(m => isInternal(m[2])).length;
+  const externalLinks = links.length - internalLinks;
+
+  // 한국어 가독성 휴리스틱: 평균 문장 길이(어절 수)
+  const sentences = cleanText.split(/[.!?。…]+|\n{2,}/).map(s => s.trim()).filter(Boolean);
+  const avgWords = sentences.length === 0 ? 0
+    : sentences.reduce((a, s) => a + s.split(/\s+/).length, 0) / sentences.length;
+
+  const paragraphs = text.split(/\n{2,}/).filter(p => p.trim().length > 20);
+
+  // 결정론적 점수
+  const lengthScore = charCount >= 3000 ? 20 : charCount >= 1500 ? 18 : charCount >= 1000 ? 14 : charCount >= 500 ? 8 : 0;
+  const imageScore = imageCount >= 6 && imageCount <= 10 ? 15 : imageCount >= 3 ? 12 : imageCount >= 1 ? 6 : 0;
+  const tagScore = hashtagCount >= 3 && hashtagCount <= 5 ? 10 : hashtagCount >= 6 && hashtagCount <= 9 ? 7 : hashtagCount >= 10 ? 3 : hashtagCount >= 1 ? 5 : 0;
+  const altScore = imageCount === 0 ? 0 : Math.round(altRatio * 5);             // 0~5
+  const linkScore = links.length === 0 ? 0 : Math.min(5, links.length);        // 0~5
+  const headingScore = headingTotal >= 3 ? 5 : headingTotal >= 1 ? 3 : 0;       // 0~5
+
+  // -------- AI 코칭 --------
+  const aiPrompt = `당신은 네이버/티스토리 블로그 SEO 전문가입니다. 아래 글을 분석해주세요.
+
+[제목] ${title || '(미입력)'}
+[타겟 키워드] ${targetKeywords || '(미입력 — 내용에서 추정)'}
+
+[자동 측정]
+- 글자수: ${charCount.toLocaleString()}자
+- 이미지: ${imageCount}장 (alt 누락 ${altMissing}건)
+- 해시태그: ${hashtagCount}개
+- 헤딩: H1 ${h1}/H2 ${h2}/한국형 ${koHead}
+- 링크: 내부 ${internalLinks} / 외부 ${externalLinks}
+- 평균 문장 길이: ${avgWords.toFixed(1)} 어절
+- 단락 수: ${paragraphs.length}개
+
+[블로그 글]
+${text.slice(0, 3500)}${text.length > 3500 ? '\n...(생략)' : ''}
+
+아래 JSON 형식만 출력하세요. 다른 텍스트 없이:
+{
+  "keyword_score": 0~25 정수,
+  "readability_score": 0~15 정수,
+  "info_score": 0~15 정수,
+  "keyword_feedback": "키워드 한 줄 피드백",
+  "readability_feedback": "가독성 한 줄 피드백",
+  "info_feedback": "정보 충실도 한 줄 피드백",
+  "improvements": ["제안1", "제안2", "제안3"],
+  "suggested_keywords": ["키워드1","키워드2","키워드3","키워드4","키워드5"],
+  "overall_comment": "전반적 총평"
+}`;
+
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: aiPrompt }] }],
+      generationConfig: {
+        temperature: 0.25,
+        maxOutputTokens: 1500,
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: 'object',
+          properties: {
+            keyword_score:        { type: 'integer' },
+            readability_score:    { type: 'integer' },
+            info_score:           { type: 'integer' },
+            keyword_feedback:     { type: 'string' },
+            readability_feedback: { type: 'string' },
+            info_feedback:        { type: 'string' },
+            improvements:         { type: 'array', items: { type: 'string' } },
+            suggested_keywords:   { type: 'array', items: { type: 'string' } },
+            overall_comment:      { type: 'string' },
+          },
+          required: ['keyword_score', 'readability_score', 'info_score', 'overall_comment'],
+        },
+      },
+    }),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message);
+  const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+  // 견고한 JSON 파싱 — 4단계 fallback
+  let json;
+  try { json = JSON.parse(raw); }
+  catch {
+    try {
+      let cleaned = raw.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+      const fb = cleaned.indexOf('{'), lb = cleaned.lastIndexOf('}');
+      if (fb >= 0 && lb > fb) cleaned = cleaned.slice(fb, lb + 1);
+      json = JSON.parse(cleaned);
+    } catch {
+      try {
+        let fixed = raw.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+        const fb = fixed.indexOf('{'), lb = fixed.lastIndexOf('}');
+        if (fb >= 0 && lb > fb) fixed = fixed.slice(fb, lb + 1);
+        fixed = fixed.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ');
+        json = JSON.parse(fixed);
+      } catch {
+        const ex = (k, n = false) => raw.match(n ? new RegExp(`"${k}"\\s*:\\s*(\\d+)`) : new RegExp(`"${k}"\\s*:\\s*"([^"]+)"`))?.[1];
+        const exA = (k) => {
+          const m = raw.match(new RegExp(`"${k}"\\s*:\\s*\\[([^\\]]+)\\]`));
+          return m ? [...m[1].matchAll(/"([^"]+)"/g)].map(x => x[1]) : [];
+        };
+        json = {
+          keyword_score: parseInt(ex('keyword_score', true) || '0'),
+          readability_score: parseInt(ex('readability_score', true) || '0'),
+          info_score: parseInt(ex('info_score', true) || '0'),
+          keyword_feedback: ex('keyword_feedback') || '분석 데이터 부분 손실',
+          readability_feedback: ex('readability_feedback') || '분석 데이터 부분 손실',
+          info_feedback: ex('info_feedback') || '분석 데이터 부분 손실',
+          improvements: exA('improvements'),
+          suggested_keywords: exA('suggested_keywords'),
+          overall_comment: ex('overall_comment') || '분석 일부 누락. 다시 시도해보세요.',
+        };
+      }
+    }
+  }
+
+  // JSON-LD 권고 (여행글 가정 — Article + Place)
+  const jsonLd = {
+    '@context': 'https://schema.org',
+    '@type': 'Article',
+    headline: title || '제목 미입력',
+    keywords: (json.suggested_keywords || []).join(', '),
+    articleBody: cleanText.slice(0, 200) + (cleanText.length > 200 ? '…' : ''),
+    inLanguage: 'ko',
+  };
+
+  return {
+    auto: { length: lengthScore, image: imageScore, hashtag: tagScore },
+    extra: { alt: altScore, link: linkScore, heading: headingScore },
+    ai: {
+      keyword: Math.min(25, Math.max(0, json.keyword_score || 0)),
+      readability: Math.min(15, Math.max(0, json.readability_score || 0)),
+      info: Math.min(15, Math.max(0, json.info_score || 0)),
+    },
+    feedback: {
+      keyword: json.keyword_feedback || '',
+      readability: json.readability_feedback || '',
+      info: json.info_feedback || '',
+    },
+    improvements: json.improvements || [],
+    keywords: json.suggested_keywords || [],
+    comment: json.overall_comment || '',
+    meta: {
+      charCount, imageCount, hashtagCount,
+      altMissing, h1, h2, koHead,
+      internalLinks, externalLinks,
+      avgWords: Number(avgWords.toFixed(1)),
+    },
+    jsonLd,
+  };
+}
+
 function BlogWriter({ apiKey, sample, customRules, draft, onDraftChange, savedBlogs, onSavedBlogsChange, seed, onSeedConsumed, onNeedKey }) {
   // draft에서 복원, 없으면 기본값
   const [meta, setMeta] = useState(draft?.meta || { title: '', day: '', intro: '', hashtags: '' });
@@ -1624,6 +1841,12 @@ function BlogWriter({ apiKey, sample, customRules, draft, onDraftChange, savedBl
   const [editingResult, setEditingResult] = useState(false);
   const [resultDraft, setResultDraft] = useState('');
   const [refining, setRefining] = useState(false);
+  // ★ 영구 저장본 식별: 동일 글에 대해 "수정-저장"이 가능하도록 id 추적
+  const [currentBlogId, setCurrentBlogId] = useState(draft?.currentBlogId || null);
+  const [lastSavedAt, setLastSavedAt] = useState(draft?.lastSavedAt || null);
+  const [postStatus, setPostStatus] = useState(draft?.postStatus || 'draft'); // draft | saved | published
+  const [publishedAt, setPublishedAt] = useState(draft?.publishedAt || null);
+  const [dirty, setDirty] = useState(false); // 마지막 저장 이후 변경 여부
   const fileRef = useRef(null);
 
   const useGP = isGoogleConfigured();
@@ -1640,42 +1863,96 @@ function BlogWriter({ apiKey, sample, customRules, draft, onDraftChange, savedBl
     }
   }, [seed]);
 
-  // ★ 자동 저장 — meta/scenes/result 변경 시 draft에 저장 (디바운스)
+  // ★ 자동 저장(임시본) — meta/scenes/result 변경 시 localStorage에 보존 (디바운스)
   useEffect(() => {
     const t = setTimeout(() => {
       const hasContent = meta.title || scenes.length > 0 || result;
       if (hasContent) {
-        onDraftChange({ meta, scenes, result, dayContext, updatedAt: Date.now() });
+        onDraftChange({
+          meta, scenes, result, dayContext,
+          currentBlogId, lastSavedAt, postStatus, publishedAt,
+          updatedAt: Date.now(),
+        });
       } else {
         onDraftChange(null);
       }
     }, 500);
     return () => clearTimeout(t);
-  }, [meta, scenes, result, dayContext]);
+  }, [meta, scenes, result, dayContext, currentBlogId, lastSavedAt, postStatus, publishedAt]);
 
-  // 영구 저장
+  // ★ 본문 편집 → dirty 플래그 (저장 안 됨 상태 표시)
+  useEffect(() => { setDirty(true); }, [meta, scenes, result]);
+
+  // 영구 저장 — 기존 id가 있으면 업데이트, 없으면 신규 생성
   const saveBlogPermanent = () => {
-    if (!result) { alert('저장할 글이 없습니다.'); return; }
+    const hasContent = meta.title || scenes.length > 0 || result;
+    if (!hasContent) { alert('저장할 내용이 없습니다.'); return; }
     const title = meta.title || '제목 없음';
+    const now = Date.now();
+    const id = currentBlogId || uid();
+    const newStatus = postStatus === 'published' ? 'published' : 'saved';
     const blog = {
-      id: uid(),
+      id,
       title,
       meta: { ...meta },
       scenes: scenes.map(s => ({ ...s })),
       result,
-      savedAt: Date.now(),
+      savedAt: now,
+      status: newStatus,
+      publishedAt: publishedAt || null,
+      seoHistory: (savedBlogs.find(b => b.id === id)?.seoHistory) || [],
     };
-    onSavedBlogsChange([blog, ...savedBlogs]);
-    alert(`"${title}" 저장 완료. 저장된 글 목록에서 다시 불러올 수 있습니다.`);
+    const exists = savedBlogs.some(b => b.id === id);
+    onSavedBlogsChange(exists
+      ? savedBlogs.map(b => b.id === id ? blog : b)
+      : [blog, ...savedBlogs]);
+    setCurrentBlogId(id);
+    setLastSavedAt(now);
+    setPostStatus(newStatus);
+    setDirty(false);
+  };
+
+  // 발행 — 저장된 상태에서만 가능. 클립보드 복사 + 발행 표시
+  const publishPost = async () => {
+    if (!result) { alert('먼저 본문을 생성하거나 저장하세요.'); return; }
+    if (dirty || !currentBlogId) {
+      // 저장 안 된 경우 자동 저장 후 발행
+      saveBlogPermanent();
+    }
+    const now = Date.now();
+    setPostStatus('published');
+    setPublishedAt(now);
+    try { await navigator.clipboard.writeText(result); } catch {}
+    // savedBlogs에도 반영
+    const id = currentBlogId || (savedBlogs[0]?.id);
+    if (id) {
+      onSavedBlogsChange(savedBlogs.map(b => b.id === id
+        ? { ...b, status: 'published', publishedAt: now, result, meta: { ...meta }, savedAt: now }
+        : b));
+    }
+    alert('발행 처리되었습니다.\n본문이 클립보드에 복사되었으니 네이버/티스토리에 붙여넣어 게시하세요.');
+  };
+
+  // 분석 결과를 현재 글에 결합해 보관
+  const recordSeoHistory = (seo) => {
+    if (!currentBlogId) return;
+    onSavedBlogsChange(savedBlogs.map(b => b.id === currentBlogId
+      ? { ...b, seoHistory: [...(b.seoHistory || []), { at: Date.now(), seo }] }
+      : b));
   };
 
   const loadSavedBlog = (blog) => {
-    if (result && !confirm('현재 작업 중인 내용이 있습니다. 불러오면 덮어씁니다. 계속할까요?')) return;
+    if (result && dirty && !confirm('현재 작업 중인 내용이 있습니다. 불러오면 덮어씁니다. 계속할까요?')) return;
     setMeta(blog.meta);
     setScenes(blog.scenes);
     setResult(blog.result);
+    setCurrentBlogId(blog.id);
+    setLastSavedAt(blog.savedAt || null);
+    setPostStatus(blog.status || 'saved');
+    setPublishedAt(blog.publishedAt || null);
     setBView('preview');
     setShowSavedList(false);
+    setTimeout(() => setDirty(false), 0); // 직후 useEffect의 dirty 세팅 무력화
   };
 
   const deleteSavedBlog = (id) => {
@@ -1690,8 +1967,13 @@ function BlogWriter({ apiKey, sample, customRules, draft, onDraftChange, savedBl
     setResult('');
     setDayContext(null);
     setSeoData(null);
+    setCurrentBlogId(null);
+    setLastSavedAt(null);
+    setPostStatus('draft');
+    setPublishedAt(null);
     setBView('edit');
     onDraftChange(null);
+    setTimeout(() => setDirty(false), 0);
   };
 
   const handleUpload = async (e) => {
@@ -1913,150 +2195,21 @@ ${instruction}`;
     if (!result) { alert('먼저 글을 생성하세요.'); return; }
     if (!apiKey) { alert('API 키가 필요합니다.'); onNeedKey(); return; }
     setSeoLoading(true); setSeoData(null); setBView('seo');
-
-    const cleanText = result.replace(/\[📷[^\]]*\]/g, '').trim();
-    const charCount = cleanText.replace(/\s/g, '').length;
-    const imageCount = (result.match(/\[📷\s*\d+\]/g) || []).length;
-    const hashtagLine = result.match(/^#.+/m)?.[0] || '';
-    const hashtagCount = (hashtagLine.match(/#\S+/g) || []).length;
-    const paragraphs = result.split(/\n{2,}/).filter(p => p.trim().length > 20);
-
-    const lengthScore = charCount >= 3000 ? 20 : charCount >= 1500 ? 18 : charCount >= 1000 ? 14 : charCount >= 500 ? 8 : 0;
-    const imageScore = imageCount >= 6 && imageCount <= 10 ? 15 : imageCount >= 3 ? 12 : imageCount >= 1 ? 6 : 0;
-    const tagScore = hashtagCount >= 3 && hashtagCount <= 5 ? 10 : hashtagCount >= 6 && hashtagCount <= 9 ? 7 : hashtagCount >= 10 ? 3 : hashtagCount >= 1 ? 5 : 0;
-
-    const aiPrompt = `당신은 네이버 블로그 SEO 전문가입니다. 아래 블로그 글을 분석해주세요.
-
-[자동 측정]
-- 글자수: ${charCount.toLocaleString()}자
-- 이미지: ${imageCount}장
-- 해시태그: ${hashtagCount}개
-- 단락 수: ${paragraphs.length}개
-
-[블로그 글]
-${result.slice(0, 3500)}${result.length > 3500 ? '\n...(생략)' : ''}
-
-아래 JSON 형식만 출력하세요. 다른 텍스트 없이:
-{
-  "keyword_score": 0~25 정수,
-  "readability_score": 0~15 정수,
-  "info_score": 0~15 정수,
-  "keyword_feedback": "키워드 한 줄 피드백",
-  "readability_feedback": "가독성 한 줄 피드백",
-  "info_feedback": "정보 충실도 한 줄 피드백",
-  "improvements": ["제안1", "제안2", "제안3"],
-  "suggested_keywords": ["키워드1","키워드2","키워드3","키워드4","키워드5"],
-  "overall_comment": "전반적 총평"
-}`;
-
     try {
-      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: aiPrompt }] }],
-          generationConfig: {
-            temperature: 0.25,
-            maxOutputTokens: 1500,
-            // ★ Structured Output — JSON을 강제로 유효하게 만듦
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: 'object',
-              properties: {
-                keyword_score:        { type: 'integer' },
-                readability_score:    { type: 'integer' },
-                info_score:           { type: 'integer' },
-                keyword_feedback:     { type: 'string' },
-                readability_feedback: { type: 'string' },
-                info_feedback:        { type: 'string' },
-                improvements:         { type: 'array', items: { type: 'string' } },
-                suggested_keywords:   { type: 'array', items: { type: 'string' } },
-                overall_comment:      { type: 'string' },
-              },
-              required: ['keyword_score', 'readability_score', 'info_score', 'overall_comment'],
-            },
-          },
-        }),
+      const seo = await runSeoAnalysis(result, {
+        apiKey,
+        title: meta.title,
+        targetKeywords: '',
+        hashtagsHint: meta.hashtags,
       });
-      const data = await res.json();
-      if (data.error) throw new Error(data.error.message);
-      const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-
-      // 강력한 JSON 파싱 — 3단계 fallback
-      let json;
-      try {
-        // 1차: 그대로 파싱 (structured output이면 거의 성공)
-        json = JSON.parse(raw);
-      } catch (e1) {
-        try {
-          // 2차: markdown 펜스 제거 + 중괄호 추출
-          let cleaned = raw.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-          const fb = cleaned.indexOf('{'), lb = cleaned.lastIndexOf('}');
-          if (fb >= 0 && lb > fb) cleaned = cleaned.slice(fb, lb + 1);
-          json = JSON.parse(cleaned);
-        } catch (e2) {
-          try {
-            // 3차: 줄바꿈 이스케이프 + 제어문자 제거
-            let fixed = raw
-              .replace(/```json\s*/g, '')
-              .replace(/```\s*/g, '')
-              .trim();
-            const fb = fixed.indexOf('{'), lb = fixed.lastIndexOf('}');
-            if (fb >= 0 && lb > fb) fixed = fixed.slice(fb, lb + 1);
-            // 문자열 안의 줄바꿈을 \n으로 변환
-            fixed = fixed.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ');
-            json = JSON.parse(fixed);
-          } catch (e3) {
-            // 4차: 정규식으로 개별 필드 추출
-            const extract = (key, isNum = false) => {
-              const re = isNum
-                ? new RegExp(`"${key}"\\s*:\\s*(\\d+)`)
-                : new RegExp(`"${key}"\\s*:\\s*"([^"]+)"`);
-              return raw.match(re)?.[1];
-            };
-            const extractArr = (key) => {
-              const re = new RegExp(`"${key}"\\s*:\\s*\\[([^\\]]+)\\]`);
-              const m = raw.match(re);
-              if (!m) return [];
-              return [...m[1].matchAll(/"([^"]+)"/g)].map(x => x[1]);
-            };
-            json = {
-              keyword_score: parseInt(extract('keyword_score', true) || '0'),
-              readability_score: parseInt(extract('readability_score', true) || '0'),
-              info_score: parseInt(extract('info_score', true) || '0'),
-              keyword_feedback: extract('keyword_feedback') || '분석 데이터 부분 손실',
-              readability_feedback: extract('readability_feedback') || '분석 데이터 부분 손실',
-              info_feedback: extract('info_feedback') || '분석 데이터 부분 손실',
-              improvements: extractArr('improvements'),
-              suggested_keywords: extractArr('suggested_keywords'),
-              overall_comment: extract('overall_comment') || '분석 일부 누락. 다시 시도해보세요.',
-            };
-          }
-        }
-      }
-
-      setSeoData({
-        auto: { length: lengthScore, image: imageScore, hashtag: tagScore },
-        ai: {
-          keyword: Math.min(25, Math.max(0, json.keyword_score || 0)),
-          readability: Math.min(15, Math.max(0, json.readability_score || 0)),
-          info: Math.min(15, Math.max(0, json.info_score || 0)),
-        },
-        feedback: {
-          keyword: json.keyword_feedback || '',
-          readability: json.readability_feedback || '',
-          info: json.info_feedback || '',
-        },
-        improvements: json.improvements || [],
-        keywords: json.suggested_keywords || [],
-        comment: json.overall_comment || '',
-        meta: { charCount, imageCount, hashtagCount },
-      });
+      setSeoData(seo);
+      recordSeoHistory(seo);
     } catch (err) {
       setSeoData({ error: '분석 실패: ' + err.message });
     }
     setSeoLoading(false);
   };
+
 
   const renderPreview = (text) => {
     if (!text) return null;
@@ -2147,6 +2300,31 @@ ${result.slice(0, 3500)}${result.length > 3500 ? '\n...(생략)' : ''}
           )}
         </div>
       )}
+
+      {/* ★ 항상 보이는 액션바 — 저장/미리보기/품질분석/발행 */}
+      <BlogActionBar
+        dirty={dirty}
+        postStatus={postStatus}
+        lastSavedAt={lastSavedAt}
+        publishedAt={publishedAt}
+        canSave={!!(meta.title || scenes.length > 0 || result)}
+        canPreview={!!result}
+        canPublish={!!result}
+        onSave={saveBlogPermanent}
+        onPreview={() => setBView('preview')}
+        onAnalyze={analyzeSeo}
+        onPublish={publishPost}
+      />
+
+      {/* 진행 스텝퍼 */}
+      <BlogStepper
+        view={view}
+        hasContent={!!(meta.title || scenes.length > 0 || result)}
+        hasResult={!!result}
+        saved={!!lastSavedAt && !dirty}
+        analyzed={!!seoData && !seoData.error}
+        published={postStatus === 'published'}
+      />
 
       <div style={{ display: 'flex', gap: 6, marginBottom: 20, borderBottom: `1px solid ${T.border}` }}>
         {[
@@ -2409,11 +2587,111 @@ ${result.slice(0, 3500)}${result.length > 3500 ? '\n...(생략)' : ''}
 // ============================================================================
 // SEO REPORT
 // ============================================================================
+// ============================================================================
+// 블로그 액션바 / 스텝퍼 — 저장 UX 개선
+// ============================================================================
+function BlogActionBar({ dirty, postStatus, lastSavedAt, publishedAt, canSave, canPreview, canPublish, onSave, onPreview, onAnalyze, onPublish }) {
+  const fmt = (ts) => {
+    if (!ts) return null;
+    const d = new Date(ts);
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    return `${hh}:${mm}`;
+  };
+  let badge;
+  if (postStatus === 'published') {
+    badge = { label: `발행됨 ${fmt(publishedAt) || ''}`.trim(), color: '#166534', bg: '#DCFCE7' };
+  } else if (lastSavedAt && !dirty) {
+    badge = { label: `저장됨 ${fmt(lastSavedAt)}`, color: T.accent, bg: T.accentSoft };
+  } else if (lastSavedAt && dirty) {
+    badge = { label: '변경됨 — 저장 필요', color: '#B45309', bg: '#FEF3C7' };
+  } else {
+    badge = { label: '저장 안 됨', color: T.sub, bg: T.soft };
+  }
+
+  const btn = (extra) => ({
+    display: 'inline-flex', alignItems: 'center', gap: 6,
+    padding: '8px 14px', fontFamily: T.S, fontSize: 12, fontWeight: 500,
+    border: `1px solid ${T.border}`, background: T.card, color: T.ink,
+    borderRadius: 4, cursor: 'pointer',
+    ...extra,
+  });
+  const disabledStyle = { opacity: 0.4, cursor: 'not-allowed' };
+
+  return (
+    <div style={{
+      position: 'sticky', top: 0, zIndex: 10,
+      display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
+      padding: '12px 14px', marginBottom: 12,
+      background: T.card, border: `1px solid ${T.border}`, borderRadius: 4,
+      boxShadow: '0 1px 0 rgba(0,0,0,0.02)',
+    }}>
+      <span style={{
+        padding: '4px 10px', borderRadius: 99,
+        background: badge.bg, color: badge.color,
+        fontFamily: T.S, fontSize: 11, fontWeight: 600,
+      }}>{badge.label}</span>
+
+      <div style={{ marginLeft: 'auto', display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+        <button style={btn(canSave ? {} : disabledStyle)} disabled={!canSave} onClick={onSave}>
+          <Save size={13}/> 저장
+        </button>
+        <button style={btn(canPreview ? {} : disabledStyle)} disabled={!canPreview} onClick={onPreview}>
+          <Eye size={13}/> 미리보기
+        </button>
+        <button style={btn(canPreview ? {} : disabledStyle)} disabled={!canPreview} onClick={onAnalyze}>
+          <BarChart3 size={13}/> 품질 분석
+        </button>
+        <button
+          style={btn(canPublish ? { background: T.accent, color: '#fff', borderColor: T.accent } : disabledStyle)}
+          disabled={!canPublish}
+          onClick={onPublish}
+        >
+          <Send size={13}/> 발행
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function BlogStepper({ view, hasContent, hasResult, saved, analyzed, published }) {
+  const steps = [
+    { key: 'write', label: '1. 작성', done: hasContent, active: view === 'edit' && !hasResult },
+    { key: 'save',  label: '2. 저장', done: saved,      active: hasResult && !saved },
+    { key: 'preview', label: '3. 미리보기', done: hasResult && view === 'preview', active: view === 'preview' },
+    { key: 'seo',   label: '4. 품질 분석', done: analyzed, active: view === 'seo' },
+    { key: 'publish', label: '5. 발행', done: published, active: false },
+  ];
+  return (
+    <div style={{
+      display: 'flex', gap: 4, marginBottom: 14, padding: '6px 8px',
+      background: T.soft, border: `1px solid ${T.border}`, borderRadius: 4,
+      fontFamily: T.S, fontSize: 11, overflowX: 'auto',
+    }}>
+      {steps.map((s, i) => (
+        <div key={s.key} style={{ display: 'flex', alignItems: 'center', gap: 4, whiteSpace: 'nowrap' }}>
+          <span style={{
+            padding: '4px 10px', borderRadius: 99,
+            background: s.done ? T.accentSoft : (s.active ? T.card : 'transparent'),
+            color: s.done ? T.accent : (s.active ? T.ink : T.sub),
+            border: s.active ? `1px solid ${T.accent}` : `1px solid transparent`,
+            fontWeight: s.active || s.done ? 600 : 400,
+          }}>
+            {s.done ? '✓ ' : ''}{s.label}
+          </span>
+          {i < steps.length - 1 && <span style={{ color: T.border }}>›</span>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function SEOReport({ data, onBack, onRetry }) {
-  const { auto, ai, feedback, improvements, keywords, comment, meta } = data;
+  const { auto, ai, feedback, improvements, keywords, comment, meta, extra, jsonLd } = data;
   const totalAuto = auto.length + auto.image + auto.hashtag;
   const totalAI = ai.keyword + ai.readability + ai.info;
-  const total = totalAuto + totalAI;
+  const totalExtra = extra ? (extra.alt + extra.link + extra.heading) : 0;
+  const total = Math.min(100, totalAuto + totalAI + totalExtra);
 
   const grade = total >= 80 ? { label: '우수', color: '#166534', bg: '#DCFCE7' }
               : total >= 60 ? { label: '보통', color: '#B45309', bg: '#FEF3C7' }
@@ -2427,6 +2705,14 @@ function SEOReport({ data, onBack, onRetry }) {
     { label: '키워드 최적화', max: 25, score: ai.keyword, auto: false, detail: feedback.keyword },
     { label: '가독성', max: 15, score: ai.readability, auto: false, detail: feedback.readability },
     { label: '정보 충실도', max: 15, score: ai.info, auto: false, detail: feedback.info },
+    ...(extra ? [
+      { label: '이미지 alt', max: 5, score: extra.alt, auto: true,
+        detail: meta.altMissing > 0 ? `${meta.altMissing}건 누락 — 캡션/대체텍스트를 채워주세요` : 'alt 텍스트 양호' },
+      { label: '링크', max: 5, score: extra.link, auto: true,
+        detail: `내부 ${meta.internalLinks ?? 0} · 외부 ${meta.externalLinks ?? 0} (관련 글/공식 사이트로의 링크 1~5개 권장)` },
+      { label: '헤딩 구조', max: 5, score: extra.heading, auto: true,
+        detail: `H1 ${meta.h1 ?? 0} · H2 ${meta.h2 ?? 0} · 한국형(■▶) ${meta.koHead ?? 0}` },
+    ] : []),
   ];
 
   return (
@@ -2503,10 +2789,133 @@ function SEOReport({ data, onBack, onRetry }) {
         </div>
       </div>
 
+      {jsonLd && (
+        <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 4, padding: '18px 20px', marginBottom: 16 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 8 }}>
+            <div style={css.eyebrow}>구조화 데이터 (JSON-LD)</div>
+            <button
+              style={{ ...css.secondaryBtn, fontSize: 11, padding: '4px 10px' }}
+              onClick={() => navigator.clipboard.writeText(`<script type="application/ld+json">\n${JSON.stringify(jsonLd, null, 2)}\n</script>`)}
+            >
+              <Copy size={11}/> 복사
+            </button>
+          </div>
+          <p style={{ fontFamily: T.S, fontSize: 11, color: T.sub, margin: '0 0 8px', lineHeight: 1.6 }}>
+            티스토리/워드프레스 본문 상단에 붙여넣으면 검색엔진이 글을 더 잘 이해합니다. (네이버는 미지원)
+          </p>
+          <pre style={{
+            margin: 0, padding: 12, background: T.soft, borderRadius: 3,
+            fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 11, lineHeight: 1.5,
+            color: T.ink, overflowX: 'auto', whiteSpace: 'pre',
+          }}>{JSON.stringify(jsonLd, null, 2)}</pre>
+        </div>
+      )}
+
       <div style={{ display: 'flex', gap: 8 }}>
-        <button style={css.secondaryBtn} onClick={onBack}>← 미리보기</button>
+        <button style={css.secondaryBtn} onClick={onBack}>← 돌아가기</button>
         <button style={css.secondaryBtn} onClick={onRetry}><Loader2 size={12}/> 재분석</button>
       </div>
+    </>
+  );
+}
+
+// ============================================================================
+// REVIEWER — 외부 블로그 글 붙여넣기 평가 화면
+// ============================================================================
+function Reviewer({ apiKey, onNeedKey }) {
+  const [title, setTitle] = useState('');
+  const [text, setText] = useState('');
+  const [keywords, setKeywords] = useState('');
+  const [hashtags, setHashtags] = useState('');
+  const [siteHost, setSiteHost] = useState('');
+  const [seoData, setSeoData] = useState(null);
+  const [seoLoading, setSeoLoading] = useState(false);
+
+  const run = async () => {
+    if (!apiKey) { alert('Gemini API 키가 필요합니다.'); onNeedKey?.(); return; }
+    if (!text.trim()) { alert('평가할 본문을 붙여넣어 주세요.'); return; }
+    setSeoLoading(true); setSeoData(null);
+    try {
+      const seo = await runSeoAnalysis(text, {
+        apiKey, title, targetKeywords: keywords, hashtagsHint: hashtags, siteHost,
+      });
+      setSeoData(seo);
+    } catch (err) {
+      setSeoData({ error: '분석 실패: ' + err.message });
+    }
+    setSeoLoading(false);
+  };
+
+  return (
+    <>
+      <div style={{ marginBottom: 28 }}>
+        <div style={css.eyebrow}>외부 블로그 글 평가</div>
+        <h1 style={css.hero}>붙여넣어 <span style={{ fontStyle: 'italic', color: T.accent }}>SEO 평가</span></h1>
+        <p style={css.lead}>이미 쓰신 블로그 글의 본문을 그대로 복사해 붙여넣으면 동일한 6+3 항목으로 점수를 받습니다.</p>
+      </div>
+
+      <div style={{ background: T.accentSoft, border: `1px solid ${T.accentLight}`, borderRadius: 4, padding: '14px 16px', marginBottom: 16, fontFamily: T.S, fontSize: 12, lineHeight: 1.7, color: T.accent }}>
+        <strong>가져오는 방법</strong>
+        <ol style={{ margin: '6px 0 0 18px', padding: 0 }}>
+          <li>네이버 블로그/티스토리/브런치에서 본문 영역을 드래그해 전체 선택 → 복사(Ctrl+C).</li>
+          <li>아래 <em>본문</em> 칸에 붙여넣기(Ctrl+V).</li>
+          <li>이미지는 텍스트로 붙여넣기되지 않습니다. 이미지 자리는 <code style={{ background: '#fff', padding: '0 4px', borderRadius: 2 }}>![산토리니 노을](url)</code> 형식 또는 <code style={{ background: '#fff', padding: '0 4px', borderRadius: 2 }}>[📷 1] 산토리니 노을</code> 처럼 캡션을 넣으면 alt/이미지 점수를 받을 수 있습니다.</li>
+          <li>해시태그는 본문 첫 줄 또는 아래 입력칸에 넣어주세요.</li>
+        </ol>
+      </div>
+
+      <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 4, padding: 22, marginBottom: 14 }}>
+        <div style={{ marginBottom: 12 }}>
+          <label style={css.label}>제목</label>
+          <input style={css.input} placeholder="치앙마이 카페 투어 — 5곳 솔직 후기" value={title} onChange={e => setTitle(e.target.value)}/>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+          <div>
+            <label style={css.label}>타겟 키워드 (1~3개, 쉼표)</label>
+            <input style={css.input} placeholder="치앙마이 카페, 님만해민 카페" value={keywords} onChange={e => setKeywords(e.target.value)}/>
+          </div>
+          <div>
+            <label style={css.label}>해시태그 (선택)</label>
+            <input style={css.input} placeholder="#치앙마이 #카페" value={hashtags} onChange={e => setHashtags(e.target.value)}/>
+          </div>
+        </div>
+        <div style={{ marginBottom: 12 }}>
+          <label style={css.label}>내 블로그 도메인 (선택 — 내부/외부 링크 판정용)</label>
+          <input style={css.input} placeholder="blog.naver.com/내아이디  또는  myblog.tistory.com" value={siteHost} onChange={e => setSiteHost(e.target.value)}/>
+        </div>
+        <div>
+          <label style={css.label}>본문</label>
+          <textarea
+            rows={18}
+            style={{ ...css.textarea, fontSize: 13, lineHeight: 1.7 }}
+            placeholder="여기에 블로그 본문을 붙여넣어 주세요."
+            value={text}
+            onChange={e => setText(e.target.value)}
+          />
+          <div style={{ fontFamily: T.S, fontSize: 11, color: T.sub, marginTop: 6 }}>
+            현재 {text.length.toLocaleString()}자
+          </div>
+        </div>
+
+        <button
+          onClick={run}
+          disabled={seoLoading}
+          style={{ ...css.primaryBtn, width: '100%', padding: 14, fontSize: 14, justifyContent: 'center', marginTop: 14 }}
+        >
+          {seoLoading
+            ? <><Loader2 size={16} className="spin"/> 분석 중…</>
+            : <><BarChart3 size={16}/> SEO 평가 받기</>}
+        </button>
+      </div>
+
+      {seoData && seoData.error && (
+        <div style={{ background: '#FEE2E2', border: '1px solid #FCA5A5', borderRadius: 4, padding: 16, fontFamily: T.S, fontSize: 13, color: T.danger, marginBottom: 14 }}>
+          {seoData.error}
+        </div>
+      )}
+      {seoData && !seoData.error && (
+        <SEOReport data={seoData} onBack={() => setSeoData(null)} onRetry={run}/>
+      )}
     </>
   );
 }

@@ -597,6 +597,8 @@ function GlobalStyles() {
     *, *::before, *::after { box-sizing: border-box; }
     button { font-family: inherit; cursor: pointer; }
     input, textarea, select { font-family: inherit; }
+    input[type="date"] { font-family: system-ui, sans-serif; color-scheme: light; }
+    input[type="date"]::-webkit-calendar-picker-indicator { cursor: pointer; }
     ::-webkit-scrollbar { width: 5px; height: 5px; }
     ::-webkit-scrollbar-thumb { background: rgba(19,78,74,.18); border-radius: 5px; }
     .spin { animation: spin 1s linear infinite; }
@@ -1512,11 +1514,11 @@ function TripFormModal({ mode, trip, onClose, onSave }) {
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
             <div>
               <label style={css.label}>시작일</label>
-              <input type="date" style={css.input} value={form.startDate} onChange={e => setForm({ ...form, startDate: e.target.value })}/>
+              <input type="date" style={{ ...css.input, fontFamily: 'system-ui, sans-serif', colorScheme: 'light' }} value={form.startDate} onChange={e => setForm({ ...form, startDate: e.target.value })}/>
             </div>
             <div>
               <label style={css.label}>종료일</label>
-              <input type="date" style={css.input} value={form.endDate} onChange={e => setForm({ ...form, endDate: e.target.value })}/>
+              <input type="date" style={{ ...css.input, fontFamily: 'system-ui, sans-serif', colorScheme: 'light' }} value={form.endDate} onChange={e => setForm({ ...form, endDate: e.target.value })}/>
             </div>
           </div>
 
